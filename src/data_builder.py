@@ -95,8 +95,8 @@ def calculate_reward(state: np.ndarray, action: np.ndarray, next_state: np.ndarr
     substrate_cost = action[0]
     
     # Combined reward
-    reward = (weights['W_BIOMASS'] * biomass_growth - 
-              weights['W_SUBSTRATE_COST'] * substrate_cost)
+    reward = (weights['biomass_weight'] * biomass_growth - 
+              weights['substrate_cost'] * substrate_cost)
     
     return reward
 

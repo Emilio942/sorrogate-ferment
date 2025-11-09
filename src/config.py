@@ -36,10 +36,21 @@ STATE_BOUNDS = {
     'substrate': (0.0, 50.0),     # [g/L]
 }
 
+# Initial state ranges for sampling
+INITIAL_STATE_RANGES = STATE_BOUNDS
+
 # Action space bounds
 ACTION_BOUNDS = {
     'feed_rate': (0.0, 5.0),      # [g/h] substrate feed rate
 }
+
+# Dimensions
+STATE_DIM = len(STATE_BOUNDS)  # 2
+ACTION_DIM = len(ACTION_BOUNDS)  # 1
+
+# Action limits for data generation
+MAX_SUBSTRATE_ADDITION = ACTION_BOUNDS['feed_rate'][1]
+EPISODE_HORIZON = HF_PARAMS['HORIZON']
 
 # ============================================================================
 # BUDGET MANAGEMENT
@@ -53,6 +64,7 @@ BUDGET_STATE_FILE = DATA_DIR / "budget_state.json"
 # ============================================================================
 SURROGATE_CONFIG = {
     'hidden_dims': [256, 256, 128],  # MLP architecture
+    'hidden_layers': [256, 256, 128],  # Alias for compatibility
     'activation': 'relu',
     'dropout': 0.1,
     'learning_rate': 1e-3,
@@ -61,6 +73,7 @@ SURROGATE_CONFIG = {
     'epochs': 100,
     'early_stopping_patience': 15,
     'val_split': 0.2,
+    'validation_split': 0.2,  # Alias for compatibility
 }
 
 # Ensemble configuration

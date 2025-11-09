@@ -211,6 +211,16 @@ def count_parameters(model) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def format_time(seconds: float) -> str:
+    """Format seconds into human-readable time string."""
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    elif seconds < 3600:
+        return f"{seconds/60:.2f}min"
+    else:
+        return f"{seconds/3600:.2f}h"
+
+
 if __name__ == "__main__":
     # Test budget tracker
     from config import MAX_BUDGET_SECONDS, BUDGET_STATE_FILE
