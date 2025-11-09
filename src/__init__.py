@@ -1,1 +1,2 @@
-# Placeholder for src package
+"""SURROGATE-FERMENT package"""
+__version__ = "0.1.0"

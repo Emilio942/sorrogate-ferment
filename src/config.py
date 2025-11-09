@@ -1,6 +1,6 @@
 """
-Central configuration file for SURROGATE-FERMENT project.
-Contains all parameters for HF model, surrogate training, RL training, and experiments.
+Central Configuration for SURROGATE-FERMENT Project
+All hyperparameters, paths, and settings in one place.
 """
 import os
 from pathlib import Path
@@ -8,60 +8,67 @@ from pathlib import Path
 # ============================================================================
 # PROJECT PATHS
 # ============================================================================
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent.absolute()
 DATA_DIR = PROJECT_ROOT / "data"
 MODELS_DIR = PROJECT_ROOT / "models"
 RESULTS_DIR = PROJECT_ROOT / "results"
 PLOTS_DIR = PROJECT_ROOT / "plots"
 
 # Ensure directories exist
-for directory in [DATA_DIR, MODELS_DIR, RESULTS_DIR, PLOTS_DIR]:
-    directory.mkdir(parents=True, exist_ok=True)
+for dir_path in [DATA_DIR, MODELS_DIR, RESULTS_DIR, PLOTS_DIR]:
+    dir_path.mkdir(parents=True, exist_ok=True)
 
 # ============================================================================
-# HIGH-FIDELITY MODEL PARAMETERS (Fermentation ODE)
+# HIGH-FIDELITY MODEL PARAMETERS (Monod Kinetics)
 # ============================================================================
-# Monod kinetics parameters for microbial growth
 HF_PARAMS = {
-    'MU_MAX': 0.3,      # Maximum specific growth rate [1/h]
-    'K_S': 0.1,         # Substrate saturation constant [g/L]
+    'MU_MAX': 0.4,      # Maximum specific growth rate [1/h]
+    'K_S': 0.1,         # Saturation constant [g/L]
     'YXS': 0.5,         # Yield coefficient biomass/substrate [g/g]
     'K_D': 0.01,        # Death rate constant [1/h]
-    'DT': 0.1,          # Time step [h]
+    'DT': 0.1,          # Time step for integration [h]
+    'HORIZON': 50,      # Episode length [steps]
 }
 
-# Initial state ranges (for sampling initial conditions)
-INITIAL_STATE_RANGES = {
-    'biomass': (0.1, 1.0),      # [g/L]
-    'substrate': (5.0, 20.0),   # [g/L]
+# State space bounds
+STATE_BOUNDS = {
+    'biomass': (0.01, 10.0),     # [g/L]
+    'substrate': (0.0, 50.0),     # [g/L]
 }
 
-# Episode configuration
-EPISODE_HORIZON = 50            # Number of time steps per episode
-MAX_SUBSTRATE_ADDITION = 2.0    # Maximum substrate addition per step [g/L]
+# Action space bounds
+ACTION_BOUNDS = {
+    'feed_rate': (0.0, 5.0),      # [g/h] substrate feed rate
+}
 
 # ============================================================================
-# BUDGET CONFIGURATION
+# BUDGET MANAGEMENT
 # ============================================================================
-HF_BUDGET_SECONDS = 8 * 3600    # 8 hours in seconds
-INITIAL_DATASET_EPISODES = 100   # Number of episodes for initial dataset
+MAX_BUDGET_SECONDS = 8 * 3600  # 8 hours total HF model usage
+INITIAL_DATASET_EPISODES = 200  # Initial exploration episodes
 BUDGET_STATE_FILE = DATA_DIR / "budget_state.json"
 
 # ============================================================================
-# SURROGATE MODEL HYPERPARAMETERS
+# SURROGATE MODEL CONFIGURATION
 # ============================================================================
 SURROGATE_CONFIG = {
-    'hidden_layers': [128, 128, 64],  # MLP architecture
+    'hidden_dims': [256, 256, 128],  # MLP architecture
     'activation': 'relu',
+    'dropout': 0.1,
     'learning_rate': 1e-3,
-    'batch_size': 64,
+    'weight_decay': 1e-5,
+    'batch_size': 256,
     'epochs': 100,
-    'validation_split': 0.2,
-    'early_stopping_patience': 10,
+    'early_stopping_patience': 15,
+    'val_split': 0.2,
 }
 
+# Ensemble configuration
+ENSEMBLE_SIZE = 5  # Number of models in ensemble
+BOOTSTRAP_FRACTION = 0.8  # Fraction of data for each bootstrap sample
+
 # ============================================================================
-# RL TRAINING HYPERPARAMETERS (PPO)
+# REINFORCEMENT LEARNING CONFIGURATION
 # ============================================================================
 RL_CONFIG = {
     'algorithm': 'PPO',
@@ -74,88 +81,96 @@ RL_CONFIG = {
     'gae_lambda': 0.95,
     'clip_range': 0.2,
     'ent_coef': 0.01,
+    'vf_coef': 0.5,
+    'max_grad_norm': 0.5,
     'total_timesteps': 100000,
+    'eval_freq': 1000,
+    'n_eval_episodes': 10,
 }
 
 # ============================================================================
-# REWARD FUNCTION WEIGHTS (Multi-Objective)
+# REWARD FUNCTION (Multi-Objective)
 # ============================================================================
 REWARD_WEIGHTS = {
-    'W_BIOMASS': 1.0,           # Weight for biomass production
-    'W_SUBSTRATE_COST': 0.5,    # Weight for substrate consumption cost
+    'biomass_weight': 1.0,          # Maximize final biomass
+    'substrate_cost': -0.5,         # Minimize substrate usage
+    'action_penalty': -0.01,        # Penalize large actions
+    'stability_bonus': 0.1,         # Reward stable trajectories
 }
 
 # ============================================================================
 # ACTIVE LEARNING CONFIGURATION
 # ============================================================================
 AL_CONFIG = {
-    'max_iterations': 10,               # Maximum number of AL iterations
-    'n_queries_per_iteration': 100,     # Number of queries per iteration
-    'n_ensemble_models': 5,             # Number of models in ensemble
-    'candidate_episodes': 20,           # Episodes to generate candidates
-    'selection_method': 'uncertainty',  # 'uncertainty' or 'random'
+    'n_iterations': 10,             # Number of AL iterations
+    'n_queries_per_iteration': 50,  # Queries to HF model per iteration
+    'n_candidates': 1000,           # Candidate pool size
+    'query_strategy': 'uncertainty', # 'uncertainty' or 'random'
+    'uncertainty_method': 'ensemble_variance',
 }
 
 # ============================================================================
-# EVALUATION CONFIGURATION
+# DATA SCALING
 # ============================================================================
-EVAL_CONFIG = {
-    'n_episodes': 20,                   # Number of episodes for evaluation
-    'use_budget': True,                 # Whether to use budget tracking
+SCALER_CONFIG = {
+    'state_scaler_type': 'StandardScaler',  # or 'MinMaxScaler'
+    'action_scaler_type': 'MinMaxScaler',
 }
 
 # ============================================================================
-# LOGGING CONFIGURATION
+# LOGGING & EXPERIMENT TRACKING
 # ============================================================================
 LOGGING_CONFIG = {
-    'backend': 'wandb',                 # 'wandb' or 'tensorboard'
-    'project_name': 'surrogate-ferment',
-    'log_interval': 100,                # Log every N steps
+    'use_wandb': False,             # Set to True to enable WandB
+    'wandb_project': 'surrogate-ferment',
+    'wandb_entity': None,           # Your WandB username
+    'tensorboard_log_dir': 'runs',
+    'save_frequency': 10,           # Save models every N iterations
 }
-
-# ============================================================================
-# STATE AND ACTION SPACE DIMENSIONS
-# ============================================================================
-STATE_DIM = 2       # [biomass, substrate]
-ACTION_DIM = 1      # [substrate_addition]
-
-# Action space bounds
-ACTION_SPACE_LOW = 0.0
-ACTION_SPACE_HIGH = MAX_SUBSTRATE_ADDITION
 
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
-def get_dataset_path(version: int, suffix: str = "") -> Path:
-    """Get path for dataset file."""
-    if suffix:
-        return DATA_DIR / f"D_v{version}_{suffix}.pkl"
-    return DATA_DIR / f"D_v{version}.pkl"
+def get_dataset_path(version: str, suffix: str = "initial") -> Path:
+    """Get standardized dataset path."""
+    return DATA_DIR / f"D_v{version}_{suffix}.pkl"
 
-def get_scaler_path(scaler_type: str, version: int) -> Path:
-    """Get path for scaler file.
-    
-    Args:
-        scaler_type: 'state' or 'action'
-        version: Version number
-    """
+def get_scaler_path(scaler_type: str, version: str) -> Path:
+    """Get standardized scaler path."""
     return MODELS_DIR / f"scaler_{scaler_type}_v{version}.pkl"
 
-def get_surrogate_path(version: int, ensemble_index: int = None) -> Path:
-    """Get path for surrogate model file.
-    
-    Args:
-        version: Version number
-        ensemble_index: If provided, returns path for ensemble member
-    """
+def get_surrogate_path(version: str, ensemble_index: int = None) -> Path:
+    """Get standardized surrogate model path."""
     if ensemble_index is not None:
         return MODELS_DIR / f"surrogate_v{version}_ens_{ensemble_index}.pth"
     return MODELS_DIR / f"surrogate_v{version}_best.pth"
 
-def get_policy_path(version: int) -> Path:
-    """Get path for RL policy file."""
+def get_policy_path(version: str) -> Path:
+    """Get standardized RL policy path."""
     return MODELS_DIR / f"policy_v{version}.zip"
 
-def get_results_path(name: str) -> Path:
-    """Get path for results file."""
-    return RESULTS_DIR / f"{name}.json"
+def get_results_path(experiment_name: str, suffix: str = "") -> Path:
+    """Get standardized results path."""
+    exp_dir = RESULTS_DIR / experiment_name
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    if suffix:
+        return exp_dir / f"{suffix}.json"
+    return exp_dir
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+def validate_config():
+    """Validate configuration consistency."""
+    assert HF_PARAMS['DT'] > 0, "DT must be positive"
+    assert HF_PARAMS['HORIZON'] > 0, "HORIZON must be positive"
+    assert MAX_BUDGET_SECONDS > 0, "Budget must be positive"
+    assert INITIAL_DATASET_EPISODES > 0, "Initial episodes must be positive"
+    assert ENSEMBLE_SIZE >= 1, "Ensemble size must be at least 1"
+    print("✓ Configuration validated successfully")
+
+if __name__ == "__main__":
+    validate_config()
+    print(f"Project root: {PROJECT_ROOT}")
+    print(f"Data directory: {DATA_DIR}")
+    print(f"Models directory: {MODELS_DIR}")
