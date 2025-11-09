@@ -3,6 +3,7 @@ Central Configuration for SURROGATE-FERMENT Project
 All hyperparameters, paths, and settings in one place.
 """
 import os
+import numpy as np
 from pathlib import Path
 
 # ============================================================================
@@ -43,6 +44,14 @@ INITIAL_STATE_RANGES = STATE_BOUNDS
 ACTION_BOUNDS = {
     'feed_rate': (0.0, 5.0),      # [g/h] substrate feed rate
 }
+
+# Action space arrays for Gym environments
+ACTION_SPACE_LOW = np.array([ACTION_BOUNDS['feed_rate'][0]])
+ACTION_SPACE_HIGH = np.array([ACTION_BOUNDS['feed_rate'][1]])
+
+# State space arrays
+STATE_SPACE_LOW = np.array([STATE_BOUNDS['biomass'][0], STATE_BOUNDS['substrate'][0]])
+STATE_SPACE_HIGH = np.array([STATE_BOUNDS['biomass'][1], STATE_BOUNDS['substrate'][1]])
 
 # Dimensions
 STATE_DIM = len(STATE_BOUNDS)  # 2
