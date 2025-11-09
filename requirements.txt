@@ -1,0 +1,31 @@
+# SURROGATE-FERMENT Requirements
+# Python 3.10+
+
+# Core Scientific Computing
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+
+# Machine Learning & Deep Learning
+torch>=2.0.0
+scikit-learn>=1.3.0
+
+# Reinforcement Learning
+gymnasium>=0.28.0
+stable-baselines3>=2.0.0
+
+# Experiment Tracking & Logging
+wandb>=0.15.0
+tensorboard>=2.13.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Testing
+pytest>=7.3.0
+pytest-cov>=4.1.0
+
+# Development
+ipython>=8.12.0
+jupyter>=1.0.0
