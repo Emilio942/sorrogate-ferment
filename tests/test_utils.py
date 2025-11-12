@@ -3,6 +3,7 @@ Tests for utility functions and BudgetTracker.
 """
 import pytest
 import numpy as np
+import pandas as pd
 import tempfile
 from pathlib import Path
 import sys
@@ -14,14 +15,24 @@ from utils import (
     save_dataset, load_dataset,
     save_scaler, load_scaler,
     BudgetTracker,
-    create_dummy_dataset,
     format_time
 )
 
 
+def _make_dummy_dataset(n_samples: int = 50, state_dim: int = 2, action_dim: int = 1):
+    """Create an in-memory dummy dataset for testing."""
+    rng = np.random.default_rng(seed=42)
+    return pd.DataFrame({
+        'state': [rng.random(state_dim) for _ in range(n_samples)],
+        'action': [rng.random(action_dim) for _ in range(n_samples)],
+        'next_state': [rng.random(state_dim) for _ in range(n_samples)],
+        'reward': rng.normal(size=n_samples).astype(float),
+    })
+
+
 def test_create_dummy_dataset():
     """Test dummy dataset creation."""
-    dataset = create_dummy_dataset(n_samples=50, state_dim=2, action_dim=1)
+    dataset = _make_dummy_dataset(n_samples=50, state_dim=2, action_dim=1)
     
     assert len(dataset) == 50
     assert 'state' in dataset.columns
@@ -39,7 +50,7 @@ def test_dataset_save_load():
     """Test dataset save and load."""
     with tempfile.TemporaryDirectory() as tmpdir:
         # Create dummy dataset
-        dataset = create_dummy_dataset(n_samples=20)
+        dataset = _make_dummy_dataset(n_samples=20)
         
         # Save
         filepath = Path(tmpdir) / 'test_dataset.pkl'
@@ -86,12 +97,12 @@ def test_budget_tracker_initialization():
         budget_file = Path(tmpdir) / 'budget_state.json'
         
         # Create new tracker
-        tracker = BudgetTracker(budget_file=budget_file, total_budget=1000.0)
+        tracker = BudgetTracker(budget_file=budget_file, max_budget_seconds=1000.0)
         
-        assert tracker.spent_time == 0.0
-        assert tracker.spent_queries == 0
-        assert tracker.get_remaining_time() == 1000.0
-        assert tracker.get_remaining_percentage() == 100.0
+        assert tracker.spent_seconds == 0.0
+        assert tracker.n_queries == 0
+        assert tracker.get_remaining() == pytest.approx(1000.0)
+        assert tracker.get_usage_percentage() == pytest.approx(0.0)
         assert budget_file.exists()
 
 
@@ -99,34 +110,35 @@ def test_budget_tracker_update():
     """Test BudgetTracker update."""
     with tempfile.TemporaryDirectory() as tmpdir:
         budget_file = Path(tmpdir) / 'budget_state.json'
-        tracker = BudgetTracker(budget_file=budget_file, total_budget=1000.0)
+        tracker = BudgetTracker(budget_file=budget_file, max_budget_seconds=1000.0)
         
-        # Update budget
-        tracker.update_budget(spent_time=100.0, n_queries=10)
+        # Update budget twice
+        tracker.update_budget(100.0)
+        tracker.update_budget(50.0)
         
-        assert tracker.spent_time == 100.0
-        assert tracker.spent_queries == 10
-        assert tracker.get_remaining_time() == 900.0
-        assert tracker.get_remaining_percentage() == 90.0
+        assert tracker.spent_seconds == pytest.approx(150.0)
+        assert tracker.n_queries == 2
+        assert tracker.get_remaining() == pytest.approx(850.0)
+        assert tracker.get_usage_percentage() == pytest.approx(15.0)
 
 
 def test_budget_tracker_check():
     """Test BudgetTracker check method."""
     with tempfile.TemporaryDirectory() as tmpdir:
         budget_file = Path(tmpdir) / 'budget_state.json'
-        tracker = BudgetTracker(budget_file=budget_file, total_budget=1000.0)
+        tracker = BudgetTracker(budget_file=budget_file, max_budget_seconds=1000.0)
         
         # Should have enough budget
-        assert tracker.check_budget(500.0) == True
+        assert tracker.check_budget(500.0) is True
         
-        # Update budget
-        tracker.update_budget(spent_time=900.0, n_queries=50)
+        # Update budget close to limit
+        tracker.update_budget(950.0)
         
-        # Should not have enough budget
-        assert tracker.check_budget(200.0) == False
+        # Should not have enough budget for larger request
+        assert tracker.check_budget(100.0) is False
         
-        # Should have enough for smaller request
-        assert tracker.check_budget(50.0) == True
+        # Should allow small remaining usage
+        assert tracker.check_budget(40.0) is True
 
 
 def test_budget_tracker_persistence():
@@ -135,37 +147,38 @@ def test_budget_tracker_persistence():
         budget_file = Path(tmpdir) / 'budget_state.json'
         
         # Create first tracker and update
-        tracker1 = BudgetTracker(budget_file=budget_file, total_budget=1000.0)
-        tracker1.update_budget(spent_time=200.0, n_queries=20)
+        tracker1 = BudgetTracker(budget_file=budget_file, max_budget_seconds=1000.0)
+        tracker1.update_budget(200.0)
+        tracker1.update_budget(50.0)
         
         # Create second tracker (should load saved state)
-        tracker2 = BudgetTracker(budget_file=budget_file, total_budget=1000.0)
+        tracker2 = BudgetTracker(budget_file=budget_file, max_budget_seconds=1000.0)
         
-        assert tracker2.spent_time == 200.0
-        assert tracker2.spent_queries == 20
-        assert tracker2.get_remaining_time() == 800.0
+        assert tracker2.spent_seconds == pytest.approx(250.0)
+        assert tracker2.n_queries == 2
+        assert tracker2.get_remaining() == pytest.approx(750.0)
 
 
 def test_budget_tracker_reset():
     """Test BudgetTracker reset."""
     with tempfile.TemporaryDirectory() as tmpdir:
         budget_file = Path(tmpdir) / 'budget_state.json'
-        tracker = BudgetTracker(budget_file=budget_file, total_budget=1000.0)
+        tracker = BudgetTracker(budget_file=budget_file, max_budget_seconds=1000.0)
         
         # Update budget
-        tracker.update_budget(spent_time=500.0, n_queries=50)
-        assert tracker.spent_time == 500.0
+        tracker.update_budget(500.0)
+        assert tracker.spent_seconds == pytest.approx(500.0)
         
         # Reset
         tracker.reset()
-        assert tracker.spent_time == 0.0
-        assert tracker.spent_queries == 0
-        assert tracker.get_remaining_time() == 1000.0
+        assert tracker.spent_seconds == 0.0
+        assert tracker.n_queries == 0
+        assert tracker.get_remaining() == pytest.approx(1000.0)
 
 
 def test_format_time():
     """Test time formatting."""
-    assert format_time(30) == "30s"
-    assert format_time(90) == "1m 30s"
-    assert format_time(3665) == "1h 1m 5s"
-    assert format_time(7325) == "2h 2m 5s"
+    assert format_time(30) == "30.00s"
+    assert format_time(90) == "1.50min"
+    assert format_time(3665) == "1.02h"
+    assert format_time(7325) == "2.03h"

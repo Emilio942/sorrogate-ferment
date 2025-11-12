@@ -247,7 +247,7 @@ def query_hf_model(
                   f"Time: {format_time(total_time)}")
     
     # Update budget
-    budget_tracker.update_budget(total_time, n_queries=len(queries))
+    budget_tracker.update_budget(total_time)
     
     if verbose:
         print(f"   ✓ Completed {len(new_transitions)} queries")
@@ -335,10 +335,14 @@ def main():
     n_ensemble = AL_CONFIG['n_ensemble_models']
     
     # Initialize budget tracker
-    budget_tracker = BudgetTracker()
+    budget_tracker = BudgetTracker(
+        budget_file=Path('budget.json'),
+        max_budget_seconds=28800  # 8 hours
+    )
     print(f"\n📊 Budget status:")
-    print(f"   Remaining: {format_time(budget_tracker.get_remaining_time())}")
-    print(f"   Used: {budget_tracker.get_summary()['spent_percentage']:.1f}%")
+    status = budget_tracker.get_status()
+    print(f"   Remaining: {format_time(status['remaining_seconds'])}")
+    print(f"   Used: {status['usage_percentage']:.1f}%")
     
     # Load dataset
     print(f"\n📂 Loading dataset from: {args.dataset_path}")
@@ -406,10 +410,10 @@ def main():
     
     # Final budget status
     print(f"\n📊 Final budget status:")
-    summary = budget_tracker.get_summary()
-    print(f"   Used: {summary['spent_percentage']:.1f}%")
-    print(f"   Remaining: {format_time(summary['remaining_time_seconds'])}")
-    print(f"   Total queries: {summary['total_queries']}")
+    status = budget_tracker.get_status()
+    print(f"   Used: {status['usage_percentage']:.1f}%")
+    print(f"   Remaining: {format_time(status['remaining_seconds'])}")
+    print(f"   Total queries: {status['n_queries']}")
     
     print("\n" + "=" * 70)
     print("✅ ACTIVE LEARNING COMPLETE")

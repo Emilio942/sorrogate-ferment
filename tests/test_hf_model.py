@@ -15,7 +15,13 @@ from hf_model import (
     sample_initial_state,
     query_single_step
 )
-from config import HF_PARAMS, EPISODE_HORIZON
+from config import (
+    HF_PARAMS,
+    EPISODE_HORIZON,
+    INITIAL_STATE_RANGES,
+    ACTION_SPACE_LOW,
+    ACTION_SPACE_HIGH
+)
 
 
 def test_hf_dynamics_zero_action():
@@ -71,20 +77,23 @@ def test_hf_dynamics_no_nans():
 def test_sample_initial_state():
     """Test initial state sampling."""
     # Sample multiple states
+    biomass_range = INITIAL_STATE_RANGES['biomass']
+    substrate_range = INITIAL_STATE_RANGES['substrate']
+
     for _ in range(10):
         state = sample_initial_state()
-        
+
         assert len(state) == 2
-        
-        # Check bounds (from INITIAL_STATE_RANGES in config)
-        assert 0.1 <= state[0] <= 1.0   # Biomass
-        assert 5.0 <= state[1] <= 20.0  # Substrate
+        assert biomass_range[0] <= state[0] <= biomass_range[1]
+        assert substrate_range[0] <= state[1] <= substrate_range[1]
 
 
 def test_simulate_episode_shape():
     """Test that episode simulation returns correct structure."""
     def random_policy(state):
-        return np.array([np.random.uniform(0, 1)])
+        return np.array([
+            np.random.uniform(ACTION_SPACE_LOW[0], ACTION_SPACE_HIGH[0])
+        ])
     
     initial_state = sample_initial_state()
     trajectory, elapsed_time = simulate_episode(
@@ -108,7 +117,7 @@ def test_simulate_episode_shape():
 def test_simulate_episode_no_nans():
     """Test that episode doesn't produce NaNs."""
     def constant_policy(state):
-        return np.array([0.5])
+        return np.array([(ACTION_SPACE_HIGH[0] - ACTION_SPACE_LOW[0]) * 0.2])
     
     initial_state = sample_initial_state()
     trajectory, elapsed_time = simulate_episode(
@@ -126,7 +135,7 @@ def test_simulate_episode_no_nans():
 def test_simulate_episode_positive_values():
     """Test that biomass and substrate remain non-negative."""
     def constant_policy(state):
-        return np.array([0.5])
+        return np.array([(ACTION_SPACE_HIGH[0] - ACTION_SPACE_LOW[0]) * 0.2])
     
     initial_state = np.array([1.0, 10.0])
     trajectory, elapsed_time = simulate_episode(

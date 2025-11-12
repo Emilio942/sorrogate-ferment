@@ -125,8 +125,11 @@ REWARD_WEIGHTS = {
 # ============================================================================
 AL_CONFIG = {
     'n_iterations': 10,             # Number of AL iterations
+    'max_iterations': 10,           # Maximum AL iterations (alias)
     'n_queries_per_iteration': 50,  # Queries to HF model per iteration
     'n_candidates': 1000,           # Candidate pool size
+    'candidate_episodes': 20,       # Episodes for candidate generation
+    'n_ensemble_models': 5,         # Number of ensemble models for uncertainty
     'query_strategy': 'uncertainty', # 'uncertainty' or 'random'
     'uncertainty_method': 'ensemble_variance',
 }

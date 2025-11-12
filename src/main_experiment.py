@@ -123,7 +123,7 @@ def run_iteration_zero(logger: ExperimentLogger = None, verbose: bool = True):
         eval_results = json.load(f)
     
     # Get budget tracker state
-    budget_tracker = BudgetTracker()
+    budget_tracker = BudgetTracker(budget_file=Path("budget.json"), max_budget_seconds=28800)
     budget_summary = budget_tracker.get_summary()
     
     results = {
@@ -177,7 +177,7 @@ def run_al_iteration(iteration: int, logger: ExperimentLogger = None,
     new_version = iteration + 1
     
     # Check budget before starting
-    budget_tracker = BudgetTracker()
+    budget_tracker = BudgetTracker(budget_file=Path("budget.json"), max_budget_seconds=28800)
     if budget_tracker.get_remaining_percentage() < 5:
         print(f"\n⚠️  Budget nearly exhausted (<5%), stopping iterations")
         return None
@@ -241,7 +241,7 @@ def run_al_iteration(iteration: int, logger: ExperimentLogger = None,
         eval_results = json.load(f)
     
     # Get budget tracker state
-    budget_tracker = BudgetTracker()
+    budget_tracker = BudgetTracker(budget_file=Path("budget.json"), max_budget_seconds=28800)
     budget_summary = budget_tracker.get_summary()
     
     results = {
@@ -324,8 +324,8 @@ def main():
         )
     
     # Initialize budget tracker
-    budget_tracker = BudgetTracker()
-    print(f"\n📊 Initial budget: {format_time(budget_tracker.total_budget)}")
+    budget_tracker = BudgetTracker(budget_file=Path("budget.json"), max_budget_seconds=28800)
+    print(f"\n📊 Initial budget: {format_time(budget_tracker.max_budget_seconds)}")
     
     all_results = []
     
@@ -337,7 +337,7 @@ def main():
         # Run active learning iterations
         for iteration in range(1, args.max_iterations + 1):
             # Check budget
-            budget_tracker = BudgetTracker()
+            budget_tracker = BudgetTracker(budget_file=Path("budget.json"), max_budget_seconds=28800)
             if not budget_tracker.check_budget(1000):  # Need at least ~15 min
                 print(f"\n⚠️  Insufficient budget for iteration {iteration}, stopping")
                 break
@@ -371,7 +371,7 @@ def main():
         print(f"\n💾 Final results saved to: {results_path}")
         
         # Final budget summary
-        budget_tracker = BudgetTracker()
+        budget_tracker = BudgetTracker(budget_file=Path("budget.json"), max_budget_seconds=28800)
         summary = budget_tracker.get_summary()
         
         print(f"\n{'='*70}")

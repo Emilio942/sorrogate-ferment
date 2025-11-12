@@ -39,23 +39,28 @@ def test_hf_params():
 
 
 def test_reward_weights():
-    """Test that reward weights are configured."""
-    assert 'W_BIOMASS' in REWARD_WEIGHTS
-    assert 'W_SUBSTRATE_COST' in REWARD_WEIGHTS
+    """Test that reward weights contain expected keys."""
+    expected_keys = {
+        'biomass_weight',
+        'substrate_cost',
+        'action_penalty',
+        'stability_bonus'
+    }
+    assert expected_keys.issubset(REWARD_WEIGHTS.keys())
 
 
 def test_path_helpers():
     """Test path helper functions."""
     # Dataset path
-    ds_path = get_dataset_path(1)
-    assert 'D_v1.pkl' in str(ds_path)
+    ds_path = get_dataset_path("1")
+    assert 'D_v1_initial.pkl' in str(ds_path)
     assert ds_path.parent == DATA_DIR
     
     # Scaler paths
-    state_scaler_path = get_scaler_path('state', 1)
+    state_scaler_path = get_scaler_path('state', "1")
     assert 'scaler_state_v1.pkl' in str(state_scaler_path)
     
-    action_scaler_path = get_scaler_path('action', 1)
+    action_scaler_path = get_scaler_path('action', "1")
     assert 'scaler_action_v1.pkl' in str(action_scaler_path)
     
     # Surrogate path
