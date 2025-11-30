@@ -114,15 +114,16 @@ class BudgetTracker:
         """
         return (self.spent_seconds + required_seconds) <= self.max_budget_seconds
     
-    def update_budget(self, elapsed_seconds: float):
+    def update_budget(self, elapsed_seconds: float, n_queries: int = 1):
         """
         Update budget with actual time spent.
         
         Args:
             elapsed_seconds: Time spent on HF model query
+            n_queries: Number of queries executed (default: 1)
         """
         self.spent_seconds += elapsed_seconds
-        self.n_queries += 1
+        self.n_queries += n_queries
         self.save()
     
     def get_remaining(self) -> float:

@@ -6,6 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -33,18 +34,25 @@ class FermentationDataset(Dataset):
     Loads dataset and applies scaling transformations.
     """
     
-    def __init__(self, dataset_path: Path, state_scaler_path: Path, 
-                 action_scaler_path: Path, bootstrap_sample: bool = False):
+    def __init__(self, dataset_path: Path = None, state_scaler_path: Path = None, 
+                 action_scaler_path: Path = None, bootstrap_sample: bool = False,
+                 dataframe: pd.DataFrame = None):
         """Initialize dataset.
         
         Args:
-            dataset_path: Path to dataset pickle file
+            dataset_path: Path to dataset pickle file (optional if dataframe provided)
             state_scaler_path: Path to fitted state scaler
             action_scaler_path: Path to fitted action scaler
             bootstrap_sample: If True, perform bootstrap sampling (for ensemble)
+            dataframe: Pre-loaded DataFrame (optional)
         """
         # Load dataset
-        self.df = load_dataset(dataset_path)
+        if dataframe is not None:
+            self.df = dataframe.copy()
+        elif dataset_path is not None:
+            self.df = load_dataset(dataset_path)
+        else:
+            raise ValueError("Either dataset_path or dataframe must be provided")
         
         # Bootstrap sampling if requested (for ensemble training)
         if bootstrap_sample:
@@ -372,22 +380,53 @@ def main():
             exp_name += f"_ens_{args.ensemble_index}"
         logger = ExperimentLogger(experiment_name=exp_name, config=config)
     
-    # Load dataset (with bootstrap if ensemble member)
+    # Load dataset
     print(f"\n📂 Loading dataset...")
+    df = load_dataset(Path(args.dataset_path))
+    
+    # Split by episode if possible
+    if 'episode_id' in df.columns:
+        print("   Splitting by episode_id to prevent data leakage...")
+        episode_ids = df['episode_id'].unique()
+        np.random.shuffle(episode_ids)
+        
+        val_split = config['validation_split']
+        n_val_episodes = int(len(episode_ids) * val_split)
+        # Ensure at least one validation episode if possible
+        if n_val_episodes == 0 and len(episode_ids) > 1:
+            n_val_episodes = 1
+            
+        val_episodes = episode_ids[:n_val_episodes]
+        train_episodes = episode_ids[n_val_episodes:]
+        
+        train_df = df[df['episode_id'].isin(train_episodes)].reset_index(drop=True)
+        val_df = df[df['episode_id'].isin(val_episodes)].reset_index(drop=True)
+        
+        print(f"   Training episodes: {len(train_episodes)}")
+        print(f"   Validation episodes: {len(val_episodes)}")
+    else:
+        print("⚠ 'episode_id' not found in dataset! Using random split (potential data leakage).")
+        # Fallback to random split
+        val_split = config['validation_split']
+        mask = np.random.rand(len(df)) < (1 - val_split)
+        train_df = df[mask].reset_index(drop=True)
+        val_df = df[~mask].reset_index(drop=True)
+
+    # Create datasets
     bootstrap = args.ensemble_index is not None
     
-    full_dataset = FermentationDataset(
-        Path(args.dataset_path),
-        Path(args.state_scaler_path),
-        Path(args.action_scaler_path),
+    train_dataset = FermentationDataset(
+        dataframe=train_df,
+        state_scaler_path=Path(args.state_scaler_path),
+        action_scaler_path=Path(args.action_scaler_path),
         bootstrap_sample=bootstrap
     )
     
-    # Train/val split
-    val_size = int(config['validation_split'] * len(full_dataset))
-    train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size]
+    val_dataset = FermentationDataset(
+        dataframe=val_df,
+        state_scaler_path=Path(args.state_scaler_path),
+        action_scaler_path=Path(args.action_scaler_path),
+        bootstrap_sample=False # Never bootstrap validation set
     )
     
     print(f"   Train samples: {len(train_dataset)}")

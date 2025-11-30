@@ -115,7 +115,7 @@ RL_CONFIG = {
 # ============================================================================
 REWARD_WEIGHTS = {
     'biomass_weight': 1.0,          # Maximize final biomass
-    'substrate_cost': -0.5,         # Minimize substrate usage
+    'substrate_cost': 0.5,          # Minimize substrate usage
     'action_penalty': -0.01,        # Penalize large actions
     'stability_bonus': 0.1,         # Reward stable trajectories
 }

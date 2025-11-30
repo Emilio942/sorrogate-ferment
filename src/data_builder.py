@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import (
     HF_PARAMS, INITIAL_DATASET_EPISODES, MAX_SUBSTRATE_ADDITION,
-    get_dataset_path, EPISODE_HORIZON
+    get_dataset_path, EPISODE_HORIZON, BUDGET_STATE_FILE, MAX_BUDGET_SECONDS
 )
 from utils import BudgetTracker, save_dataset, format_time
 from hf_model import simulate_episode, sample_initial_state
@@ -169,6 +169,7 @@ def generate_dataset(
         for state, action, next_state, _ in trajectory:
             reward = calculate_reward(state, action, next_state)
             all_transitions.append({
+                'episode_id': episode_idx,
                 'state': state,
                 'action': action,
                 'next_state': next_state,
@@ -189,9 +190,9 @@ def generate_dataset(
                   f"Transitions: {len(all_transitions)}")
             
             if budget_tracker is not None:
-                remaining_budget = budget_tracker.get_remaining_time()
+                remaining_budget = budget_tracker.get_remaining()
                 print(f"    Budget remaining: {format_time(remaining_budget)} "
-                      f"({budget_tracker.get_remaining_percentage():.1f}%)")
+                      f"({budget_tracker.get_usage_percentage():.1f}%)")
         
         # Log to experiment tracker
         if logger is not None:
@@ -213,9 +214,9 @@ def generate_dataset(
         print(f"  Avg transitions per episode: {len(dataset)/episodes_completed:.1f}")
         
         if budget_tracker is not None:
-            summary = budget_tracker.get_summary()
-            print(f"  Budget used: {summary['spent_percentage']:.1f}%")
-            print(f"  Budget remaining: {format_time(summary['remaining_time_seconds'])}")
+            summary = budget_tracker.get_status()
+            print(f"  Budget used: {summary['usage_percentage']:.1f}%")
+            print(f"  Budget remaining: {format_time(summary['remaining_seconds'])}")
     
     return dataset
 
@@ -269,10 +270,10 @@ def main():
     # Initialize budget tracker if requested
     budget_tracker = None
     if args.use_budget:
-        budget_tracker = BudgetTracker()
+        budget_tracker = BudgetTracker(BUDGET_STATE_FILE, MAX_BUDGET_SECONDS)
         print(f"\n📊 Budget tracking enabled")
-        print(f"   Total budget: {format_time(budget_tracker.total_budget)}")
-        print(f"   Remaining: {format_time(budget_tracker.get_remaining_time())}")
+        print(f"   Total budget: {format_time(budget_tracker.max_budget_seconds)}")
+        print(f"   Remaining: {format_time(budget_tracker.get_remaining())}")
     
     # Initialize logger if requested
     logger = None
