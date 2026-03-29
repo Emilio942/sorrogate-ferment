@@ -27,6 +27,7 @@ HF_PARAMS = {
     'K_S': 0.1,         # Saturation constant [g/L]
     'YXS': 0.5,         # Yield coefficient biomass/substrate [g/g]
     'K_D': 0.01,        # Death rate constant [1/h]
+    'S_FEED': 200.0,    # Concentration of feed substrate [g/L]
     'DT': 0.1,          # Time step for integration [h]
     'HORIZON': 50,      # Episode length [steps]
 }
@@ -35,14 +36,19 @@ HF_PARAMS = {
 STATE_BOUNDS = {
     'biomass': (0.01, 10.0),     # [g/L]
     'substrate': (0.0, 50.0),     # [g/L]
+    'volume': (0.1, 5.0),         # [L]
 }
 
 # Initial state ranges for sampling
-INITIAL_STATE_RANGES = STATE_BOUNDS
+INITIAL_STATE_RANGES = {
+    'biomass': (0.01, 1.0),
+    'substrate': (5.0, 20.0),
+    'volume': (1.0, 1.1),
+}
 
 # Action space bounds
 ACTION_BOUNDS = {
-    'feed_rate': (0.0, 5.0),      # [g/h] substrate feed rate
+    'feed_rate': (0.0, 5.0),      # [g/h] substrate feed rate (total mass per hour)
 }
 
 # Action space arrays for Gym environments
@@ -50,12 +56,12 @@ ACTION_SPACE_LOW = np.array([ACTION_BOUNDS['feed_rate'][0]])
 ACTION_SPACE_HIGH = np.array([ACTION_BOUNDS['feed_rate'][1]])
 
 # State space arrays
-STATE_SPACE_LOW = np.array([STATE_BOUNDS['biomass'][0], STATE_BOUNDS['substrate'][0]])
-STATE_SPACE_HIGH = np.array([STATE_BOUNDS['biomass'][1], STATE_BOUNDS['substrate'][1]])
+STATE_SPACE_LOW = np.array([STATE_BOUNDS['biomass'][0], STATE_BOUNDS['substrate'][0], STATE_BOUNDS['volume'][0]])
+STATE_SPACE_HIGH = np.array([STATE_BOUNDS['biomass'][1], STATE_BOUNDS['substrate'][1], STATE_BOUNDS['volume'][1]])
 
 # Dimensions
-STATE_DIM = len(STATE_BOUNDS)  # 2
-ACTION_DIM = len(ACTION_BOUNDS)  # 1
+STATE_DIM = 3  # biomass, substrate, volume
+ACTION_DIM = 1  # feed_rate
 
 # Action limits for data generation
 MAX_SUBSTRATE_ADDITION = ACTION_BOUNDS['feed_rate'][1]
@@ -117,7 +123,7 @@ REWARD_WEIGHTS = {
     'biomass_weight': 1.0,          # Maximize final biomass
     'substrate_cost': 0.5,          # Minimize substrate usage
     'action_penalty': -0.01,        # Penalize large actions
-    'stability_bonus': 0.1,         # Reward stable trajectories
+    'stability_bonus': 1.0,         # Reward stable trajectories
 }
 
 # ============================================================================

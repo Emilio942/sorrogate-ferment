@@ -27,13 +27,14 @@ from data_builder import calculate_reward
 # ============================================================================
 
 class SurrogateEnv(gym.Env):
-    """Gymnasium environment using surrogate model for dynamics.
+    """Gymnasium environment using an ensemble of surrogate models for dynamics.
     
     The environment:
-    - Uses a trained surrogate model to predict state transitions
+    - Uses an ensemble of trained surrogate models to predict state transitions
+    - Computes the mean prediction for transitions to reduce model bias
+    - Quantifies uncertainty as the variance across ensemble members
     - Applies proper scaling/unscaling of states and actions
     - Calculates rewards based on the multi-objective function
-    - Supports episodic interaction with configurable horizon
     """
     
     metadata = {'render_modes': []}
@@ -45,17 +46,19 @@ class SurrogateEnv(gym.Env):
         action_scaler_path: Path,
         initial_states: np.ndarray = None,
         horizon: int = EPISODE_HORIZON,
-        device: str = 'cpu'
+        device: str = 'cpu',
+        use_ensemble: bool = True
     ):
         """Initialize surrogate environment.
         
         Args:
-            surrogate_model_path: Path to trained surrogate model
+            surrogate_model_path: Path to surrogate model or directory containing ensemble
             state_scaler_path: Path to fitted state scaler
             action_scaler_path: Path to fitted action scaler
             initial_states: Array of initial states to sample from (optional)
             horizon: Episode horizon (max steps)
             device: Device for model inference
+            use_ensemble: If True, load all ensemble members in the same directory
         """
         super().__init__()
         
@@ -64,38 +67,50 @@ class SurrogateEnv(gym.Env):
         self.current_step = 0
         
         # Load scalers
-        print(f"Loading state scaler from: {state_scaler_path}")
         self.state_scaler = load_scaler(state_scaler_path)
-        
-        print(f"Loading action scaler from: {action_scaler_path}")
         self.action_scaler = load_scaler(action_scaler_path)
         
-        # Load surrogate model
-        print(f"Loading surrogate model from: {surrogate_model_path}")
-        self.surrogate_model = SurrogateModel(
-            state_dim=STATE_DIM,
-            action_dim=ACTION_DIM
-        )
-        self.surrogate_model.load_state_dict(
-            torch.load(surrogate_model_path, map_location=device)
-        )
-        self.surrogate_model.to(device)
-        self.surrogate_model.eval()  # Set to evaluation mode
+        # Load surrogate model(s)
+        self.models = []
+        surrogate_model_path = Path(surrogate_model_path)
+        
+        if use_ensemble:
+            # Check if path is a file or directory
+            if surrogate_model_path.is_file():
+                model_dir = surrogate_model_path.parent
+                model_pattern = surrogate_model_path.name.replace("_best.pth", "_ens_*.pth")
+                model_paths = list(model_dir.glob(model_pattern))
+                if not model_paths:
+                    model_paths = [surrogate_model_path]
+            else:
+                model_paths = list(surrogate_model_path.glob("surrogate_v*_ens_*.pth"))
+                if not model_paths:
+                    model_paths = list(surrogate_model_path.glob("*.pth"))
+            
+            print(f"Loading ensemble of {len(model_paths)} models from {surrogate_model_path.parent}")
+            for p in model_paths:
+                model = SurrogateModel(state_dim=STATE_DIM, action_dim=ACTION_DIM)
+                model.load_state_dict(torch.load(p, map_location=device))
+                model.to(device)
+                model.eval()
+                self.models.append(model)
+        else:
+            model = SurrogateModel(state_dim=STATE_DIM, action_dim=ACTION_DIM)
+            model.load_state_dict(torch.load(surrogate_model_path, map_location=device))
+            model.to(device)
+            model.eval()
+            self.models.append(model)
         
         # Initial states
         if initial_states is not None:
             self.initial_states = initial_states
         else:
-            # Load default initial states from config ranges
             from config import INITIAL_STATE_RANGES
             from hf_model import sample_initial_state
-            # Sample a pool of initial states
             self.initial_states = np.array([
                 sample_initial_state(INITIAL_STATE_RANGES) 
                 for _ in range(100)
             ])
-        
-        print(f"Initial states pool: {len(self.initial_states)} states")
         
         # Define action and observation spaces
         self.action_space = spaces.Box(
@@ -105,96 +120,91 @@ class SurrogateEnv(gym.Env):
             dtype=np.float32
         )
         
-        # State space: [biomass, substrate] - use generous bounds
+        # State space: [biomass, substrate, volume]
         self.observation_space = spaces.Box(
-            low=np.array([0.0, 0.0]),
-            high=np.array([50.0, 100.0]),  # Generous upper bounds
+            low=np.array([0.0, 0.0, 0.0]),
+            high=np.array([50.0, 100.0, 10.0]),
             shape=(STATE_DIM,),
             dtype=np.float32
         )
         
-        # Initialize state
         self.state = None
-        
-        print(f"Surrogate environment initialized")
-        print(f"  Action space: {self.action_space}")
-        print(f"  Observation space: {self.observation_space}")
-        print(f"  Horizon: {self.horizon}")
     
     def reset(self, seed=None, options=None):
-        """Reset environment to initial state.
-        
-        Returns:
-            Tuple of (observation, info)
-        """
         super().reset(seed=seed)
-        
-        # Sample random initial state
         idx = np.random.randint(len(self.initial_states))
         self.state = self.initial_states[idx].copy().astype(np.float32)
         self.current_step = 0
-        
         return self.state, {}
     
     def step(self, action: np.ndarray):
-        """Execute one step in the environment.
+        from scipy.optimize import root
+        from config import HF_PARAMS
         
-        Args:
-            action: Action to take [substrate_addition]
-            
-        Returns:
-            Tuple of (observation, reward, terminated, truncated, info)
-        """
-        # Ensure action is numpy array and correct shape
         action = np.array(action, dtype=np.float32).reshape(-1)
-        
-        # Clip action to valid range
         action = np.clip(action, self.action_space.low, self.action_space.high)
-        
-        # Store current state for reward calculation
         current_state = self.state.copy()
         
         # 1. Scale state and action
         state_scaled = self.state_scaler.transform(self.state.reshape(1, -1)).flatten()
         action_scaled = self.action_scaler.transform(action.reshape(1, -1)).flatten()
         
-        # 2. Concatenate input: [state, action]
-        input_tensor = torch.FloatTensor(
-            np.concatenate([state_scaled, action_scaled])
-        ).unsqueeze(0).to(self.device)
+        dt = HF_PARAMS['DT']
+        a_tensor = torch.FloatTensor(action_scaled).unsqueeze(0).to(self.device)
         
-        # 3. Predict next state (scaled)
+        # 2. Semi-Implicit Euler via Root Finding
+        def residual(s_guess_np):
+            # Equation: s_next - s_curr - dt * f(s_next, a) = 0
+            s_tensor = torch.FloatTensor(s_guess_np).unsqueeze(0).to(self.device)
+            input_tensor = torch.cat([s_tensor, a_tensor], dim=-1)
+            
+            with torch.no_grad():
+                preds = [model(input_tensor) for model in self.models]
+                mean_ds_dt = torch.mean(torch.stack(preds), dim=0).cpu().numpy().flatten()
+            
+            return s_guess_np - state_scaled - dt * mean_ds_dt
+
+        # Use scipy.optimize.root with hybr method (Powell's method)
+        # We start the guess at the current state
+        sol = root(residual, state_scaled, method='hybr')
+        s_next_scaled = sol.x
+        
+        # 3. Compute uncertainty (variance) at the new state
+        s_next_tensor = torch.FloatTensor(s_next_scaled).unsqueeze(0).to(self.device)
+        input_tensor = torch.cat([s_next_tensor, a_tensor], dim=-1)
         with torch.no_grad():
-            predicted_next_state_scaled = self.surrogate_model(input_tensor)
-            predicted_next_state_scaled = predicted_next_state_scaled.cpu().numpy()
+            preds = [model(input_tensor) for model in self.models]
+            preds_stack = torch.stack(preds) # [n_models, 1, state_dim]
+            uncertainty = torch.mean(torch.var(preds_stack, dim=0)).item()
         
         # 4. Unscale predicted next state
         next_state = self.state_scaler.inverse_transform(
-            predicted_next_state_scaled
+            s_next_scaled.reshape(1, -1)
         ).flatten().astype(np.float32)
         
-        # 5. Ensure physical constraints (non-negative values)
+        # 6. Ensure physical constraints
         next_state = np.clip(next_state, 0.0, None)
         
-        # 6. Calculate reward
+        # 7. Calculate reward
         reward = calculate_reward(current_state, action, next_state, REWARD_WEIGHTS)
         
-        # 7. Update state
+        # 8. Update state
         self.state = next_state
         self.current_step += 1
         
-        # 8. Check termination conditions
+        # 9. Termination conditions
         terminated = False
         truncated = self.current_step >= self.horizon
         
-        # Early termination if biomass or substrate depleted
         if self.state[0] < 1e-6 or self.state[1] < 0:
             terminated = True
         
         info = {
             'step': self.current_step,
             'biomass': self.state[0],
-            'substrate': self.state[1]
+            'substrate': self.state[1],
+            'volume': self.state[2],
+            'uncertainty': float(uncertainty)
         }
         
         return self.state, float(reward), terminated, truncated, info

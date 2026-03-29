@@ -7,15 +7,109 @@ import sys
 from pathlib import Path
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
+import numpy as np
+import torch
 
 # Add src to path if needed
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import RL_CONFIG, get_policy_path
+from config import RL_CONFIG, get_policy_path, STATE_DIM, ACTION_DIM, HF_PARAMS
 from surrogate_env import SurrogateEnv
 from logger import ExperimentLogger
+
+
+# ============================================================================
+# CUSTOM CALLBACKS
+# ============================================================================
+
+class AdaptiveTimeSteppingCallback(BaseCallback):
+    """
+    Dynamically adjusts the environment's dt based on the surrogate's 
+    estimated Lipschitz constant to maintain the theoretical HJB error bound:
+    dt <= sqrt(eta) / ((1 - gamma) * L_f)
+    """
+    def __init__(self, env, gamma=0.99, verbose=0):
+        super().__init__(verbose)
+        # Handle DummyVecEnv wrapping
+        self.target_env = env.envs[0] if hasattr(env, 'envs') else env
+        # Unpack Monitor if present
+        if hasattr(self.target_env, 'env'):
+            self.target_env = self.target_env.env
+            
+        self.gamma = gamma
+        self.eta = 0.01  # Default trust region / KL penalty approximation
+        self.base_dt = HF_PARAMS['DT']
+        
+    def _estimate_lipschitz(self) -> float:
+        """Estimate the maximum Lipschitz constant L_f of the surrogate models."""
+        # We estimate L_f by calculating the spectral norm of the Jacobian 
+        # for a batch of random states.
+        
+        # We need the surrogate models from the environment
+        if not hasattr(self.target_env, 'models') or len(self.target_env.models) == 0:
+            return 1.0 # fallback
+            
+        models = self.target_env.models
+        device = self.target_env.device
+        
+        # Sample random states and actions
+        B = 32
+        s = torch.randn(B, STATE_DIM, device=device, requires_grad=True)
+        a = torch.randn(B, ACTION_DIM, device=device) * 2 - 1
+        x = torch.cat([s, a], dim=-1)
+        
+        # Use the first ensemble model for estimation
+        model = models[0]
+        model.eval()
+        f = model(x)
+        
+        # Compute Jacobian J = df/ds
+        J = torch.zeros(B, STATE_DIM, STATE_DIM, device=device)
+        for i in range(STATE_DIM):
+            v = torch.zeros_like(f)
+            v[:, i] = 1.0
+            grad_s = torch.autograd.grad(f, s, grad_outputs=v, create_graph=False, retain_graph=True)[0]
+            J[:, i, :] = grad_s
+            
+        # Estimate spectral norm (max singular value)
+        # J_np = J.detach().cpu().numpy()
+        # To keep it simple in torch without SVD:
+        # L_f is bounded by the Frobenius norm
+        norms = torch.linalg.matrix_norm(J, ord='fro')
+        return norms.max().item()
+
+    def _on_step(self) -> bool:
+        # Adjust dt every 2048 steps (typically one PPO rollout)
+        if self.n_calls % 2048 == 0:
+            L_f = self._estimate_lipschitz()
+            
+            # The theoretical step-size rule
+            # Add a small epsilon to L_f to avoid division by zero
+            ideal_dt = np.sqrt(self.eta) / ((1.0 - self.gamma) * (L_f + 1e-6))
+            
+            # Bound the dynamic dt to avoid extreme simulation failures
+            # It shouldn't be much larger than base_dt, but can be smaller
+            new_dt = np.clip(ideal_dt, 0.001, self.base_dt * 2.0)
+            
+            # Inject the new dt into the environment
+            # Note: We patch it into HF_PARAMS dict globally so env.step picks it up, 
+            # or directly onto the env if we refactored it.
+            # For now, HF_PARAMS['DT'] is what SurrogateEnv uses inside step().
+            HF_PARAMS['DT'] = new_dt
+            
+            if self.verbose > 0:
+                print(f"   [Adaptive DT] L_f: {L_f:.3f} | Ideal dt: {ideal_dt:.4f} | Applied dt: {new_dt:.4f}")
+                
+            # Log it if logger callback exists
+            if hasattr(self, 'logger_cb') and self.logger_cb is not None:
+                self.logger_cb.logger.log_metrics({
+                    'rl/adaptive_dt': new_dt,
+                    'rl/lipschitz_Lf': L_f
+                }, step=self.n_calls)
+                
+        return True
 
 
 # ============================================================================
@@ -82,6 +176,7 @@ def train_rl_policy(
     callbacks.append(checkpoint_callback)
     
     # Custom logging callback
+    logger_cb = None
     if logger is not None:
         from stable_baselines3.common.callbacks import BaseCallback
         
@@ -104,7 +199,13 @@ def train_rl_policy(
                         }, step=self.n_calls)
                 return True
         
-        callbacks.append(LoggerCallback(logger))
+        logger_cb = LoggerCallback(logger)
+        callbacks.append(logger_cb)
+
+    # Adaptive Time-Stepping Callback
+    adaptive_dt_cb = AdaptiveTimeSteppingCallback(env, gamma=config['gamma'], verbose=verbose)
+    adaptive_dt_cb.logger_cb = logger_cb
+    callbacks.append(adaptive_dt_cb)
     
     # Train model
     print("\n🎯 Training...")

@@ -1,391 +1,219 @@
 """
-Main experiment orchestration: Complete active learning loop.
-Coordinates all phases from initialization through iterative improvement.
+Main experiment orchestration script for SURROGATE-FERMENT.
+Runs the complete active learning loop:
+1. Initial data generation & surrogate training
+2. Iterative RL training & active learning refinement
+3. Final evaluation and logging
 """
-import sys
-import json
+import argparse
 import subprocess
+import sys
+import time
 from pathlib import Path
+import numpy as np
 
-# Add src to path if needed
+# Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import (
-    AL_CONFIG, INITIAL_DATASET_EPISODES, EPISODE_HORIZON,
+    AL_CONFIG, INITIAL_DATASET_EPISODES, ENSEMBLE_SIZE,
     get_dataset_path, get_scaler_path, get_surrogate_path, get_policy_path,
-    get_results_path
+    MAX_BUDGET_SECONDS, BUDGET_STATE_FILE
 )
 from utils import BudgetTracker, format_time
-from logger import ExperimentLogger
 
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-def run_command(cmd: list, description: str, verbose: bool = True):
+def run_command(command: list, description: str):
     """Run a shell command and handle errors.
     
     Args:
-        cmd: Command as list of strings
-        description: Description of what the command does
-        verbose: Print output
+        command: List of command arguments
+        description: Description of the task
     """
-    if verbose:
-        print(f"\n{'='*70}")
-        print(f"{description}")
-        print(f"{'='*70}")
-        print(f"Command: {' '.join(cmd)}")
+    print(f"\n--- {description} ---")
+    print(f"Running: {' '.join(command)}")
     
-    result = subprocess.run(cmd, capture_output=not verbose)
+    start_time = time.time()
+    result = subprocess.run(command, capture_output=False, text=True)
+    elapsed = time.time() - start_time
     
     if result.returncode != 0:
-        print(f"\n❌ Error running: {description}")
-        print(f"Return code: {result.returncode}")
-        if not verbose:
-            print(f"stdout: {result.stdout.decode()}")
-            print(f"stderr: {result.stderr.decode()}")
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+        print(f"❌ Error: {description} failed with return code {result.returncode}")
+        sys.exit(1)
     
-    if verbose:
-        print(f"✓ Completed: {description}\n")
-    
-    return result
+    print(f"✓ Completed in {elapsed:.1f}s")
 
-
-# ============================================================================
-# ITERATION 0: INITIALIZATION
-# ============================================================================
-
-def run_iteration_zero(logger: ExperimentLogger = None, verbose: bool = True):
-    """Run iteration 0: Generate initial dataset and train first models.
-    
-    Returns:
-        Dictionary with iteration 0 results
-    """
-    print("\n" + "="*70)
-    print("ITERATION 0: INITIALIZATION")
-    print("="*70)
-    
-    version = 1
-    
-    # Step 1: Generate initial dataset
-    run_command([
-        'python', 'src/data_builder.py',
-        '--output_path', str(get_dataset_path(version)),
-        '--n_episodes', str(INITIAL_DATASET_EPISODES),
-        '--policy', 'random'
-    ], "Step 1: Generate initial dataset", verbose)
-    
-    # Step 2: Fit scalers
-    run_command([
-        'python', 'src/fit_scaler.py',
-        '--dataset_path', str(get_dataset_path(version)),
-        '--output_dir', 'models',
-        '--version', str(version),
-        '--verify'
-    ], "Step 2: Fit scalers", verbose)
-    
-    # Step 3: Train surrogate ensemble
-    n_ensemble = AL_CONFIG['n_ensemble_models']
-    for i in range(n_ensemble):
-        run_command([
-            'python', 'src/surrogate_model.py',
-            '--dataset_path', str(get_dataset_path(version)),
-            '--state_scaler_path', str(get_scaler_path('state', version)),
-            '--action_scaler_path', str(get_scaler_path('action', version)),
-            '--output_dir', 'models',
-            '--version', str(version),
-            '--ensemble_index', str(i)
-        ], f"Step 3.{i+1}: Train surrogate ensemble member {i}", verbose)
-    
-    # Step 4: Train RL policy
-    run_command([
-        'python', 'src/train_rl.py',
-        '--surrogate_path', str(get_surrogate_path(version, ensemble_index=0)),
-        '--state_scaler_path', str(get_scaler_path('state', version)),
-        '--action_scaler_path', str(get_scaler_path('action', version)),
-        '--save_path', str(get_policy_path(version))
-    ], "Step 4: Train RL policy", verbose)
-    
-    # Step 5: Evaluate on HF model
-    run_command([
-        'python', 'src/evaluate_policy.py',
-        '--policy_path', str(get_policy_path(version)),
-        '--policy_type', 'rl',
-        '--n_episodes', '20',
-        '--use_budget',
-        '--output_path', str(get_results_path(f'eval_v{version}'))
-    ], "Step 5: Evaluate policy on HF model", verbose)
-    
-    # Load evaluation results
-    with open(get_results_path(f'eval_v{version}'), 'r') as f:
-        eval_results = json.load(f)
-    
-    # Get budget tracker state
-    budget_tracker = BudgetTracker(budget_file=Path("budget.json"), max_budget_seconds=28800)
-    budget_summary = budget_tracker.get_summary()
-    
-    results = {
-        'iteration': 0,
-        'version': version,
-        'mean_reward': eval_results['mean_reward'],
-        'std_reward': eval_results['std_reward'],
-        'n_episodes': eval_results['n_episodes'],
-        'total_queries': budget_summary['total_queries'],
-        'spent_time': budget_summary['spent_time_seconds'],
-        'remaining_time': budget_summary['remaining_time_seconds']
-    }
-    
-    # Log to experiment tracker
-    if logger:
-        logger.log_metrics({
-            'iteration': 0,
-            'mean_reward': results['mean_reward'],
-            'std_reward': results['std_reward'],
-            'total_queries': results['total_queries']
-        }, step=0)
-    
-    print(f"\n✓ Iteration 0 complete!")
-    print(f"   Mean reward: {results['mean_reward']:.3f} ± {results['std_reward']:.3f}")
-    print(f"   Budget used: {budget_summary['spent_percentage']:.1f}%")
-    
-    return results
-
-
-# ============================================================================
-# ACTIVE LEARNING ITERATIONS
-# ============================================================================
-
-def run_al_iteration(iteration: int, logger: ExperimentLogger = None, 
-                    verbose: bool = True):
-    """Run one active learning iteration.
-    
-    Args:
-        iteration: Iteration number (>= 1)
-        logger: Experiment logger
-        verbose: Print progress
-        
-    Returns:
-        Dictionary with iteration results
-    """
-    print(f"\n{'='*70}")
-    print(f"ITERATION {iteration}: ACTIVE LEARNING")
-    print(f"{'='*70}")
-    
-    prev_version = iteration
-    new_version = iteration + 1
-    
-    # Check budget before starting
-    budget_tracker = BudgetTracker(budget_file=Path("budget.json"), max_budget_seconds=28800)
-    if budget_tracker.get_remaining_percentage() < 5:
-        print(f"\n⚠️  Budget nearly exhausted (<5%), stopping iterations")
-        return None
-    
-    # Step 1: Active learning (query selection and HF queries)
-    run_command([
-        'python', 'src/active_learning.py',
-        '--dataset_path', str(get_dataset_path(prev_version)),
-        '--policy_path', str(get_policy_path(prev_version)),
-        '--ensemble_dir', 'models',
-        '--state_scaler_path', str(get_scaler_path('state', prev_version)),
-        '--action_scaler_path', str(get_scaler_path('action', prev_version)),
-        '--version', str(prev_version),
-        '--n_queries', str(AL_CONFIG['n_queries_per_iteration']),
-        '--output_path', str(get_dataset_path(new_version)),
-        '--selection_method', 'uncertainty'
-    ], f"Step 1: Active Learning (query selection & HF queries)", verbose)
-    
-    # Step 2: Refit scalers on augmented dataset
-    run_command([
-        'python', 'src/fit_scaler.py',
-        '--dataset_path', str(get_dataset_path(new_version)),
-        '--output_dir', 'models',
-        '--version', str(new_version)
-    ], "Step 2: Refit scalers", verbose)
-    
-    # Step 3: Retrain surrogate ensemble
-    n_ensemble = AL_CONFIG['n_ensemble_models']
-    for i in range(n_ensemble):
-        run_command([
-            'python', 'src/surrogate_model.py',
-            '--dataset_path', str(get_dataset_path(new_version)),
-            '--state_scaler_path', str(get_scaler_path('state', new_version)),
-            '--action_scaler_path', str(get_scaler_path('action', new_version)),
-            '--output_dir', 'models',
-            '--version', str(new_version),
-            '--ensemble_index', str(i)
-        ], f"Step 3.{i+1}: Retrain surrogate ensemble member {i}", verbose)
-    
-    # Step 4: Retrain RL policy
-    run_command([
-        'python', 'src/train_rl.py',
-        '--surrogate_path', str(get_surrogate_path(new_version, ensemble_index=0)),
-        '--state_scaler_path', str(get_scaler_path('state', new_version)),
-        '--action_scaler_path', str(get_scaler_path('action', new_version)),
-        '--save_path', str(get_policy_path(new_version))
-    ], "Step 4: Retrain RL policy", verbose)
-    
-    # Step 5: Evaluate on HF model
-    run_command([
-        'python', 'src/evaluate_policy.py',
-        '--policy_path', str(get_policy_path(new_version)),
-        '--policy_type', 'rl',
-        '--n_episodes', '20',
-        '--use_budget',
-        '--output_path', str(get_results_path(f'eval_v{new_version}'))
-    ], "Step 5: Evaluate policy on HF model", verbose)
-    
-    # Load evaluation results
-    with open(get_results_path(f'eval_v{new_version}'), 'r') as f:
-        eval_results = json.load(f)
-    
-    # Get budget tracker state
-    budget_tracker = BudgetTracker(budget_file=Path("budget.json"), max_budget_seconds=28800)
-    budget_summary = budget_tracker.get_summary()
-    
-    results = {
-        'iteration': iteration,
-        'version': new_version,
-        'mean_reward': eval_results['mean_reward'],
-        'std_reward': eval_results['std_reward'],
-        'n_episodes': eval_results['n_episodes'],
-        'total_queries': budget_summary['total_queries'],
-        'spent_time': budget_summary['spent_time_seconds'],
-        'remaining_time': budget_summary['remaining_time_seconds']
-    }
-    
-    # Log to experiment tracker
-    if logger:
-        logger.log_metrics({
-            'iteration': iteration,
-            'mean_reward': results['mean_reward'],
-            'std_reward': results['std_reward'],
-            'total_queries': results['total_queries'],
-            'budget_remaining_pct': budget_summary['remaining_percentage']
-        }, step=iteration)
-    
-    print(f"\n✓ Iteration {iteration} complete!")
-    print(f"   Mean reward: {results['mean_reward']:.3f} ± {results['std_reward']:.3f}")
-    print(f"   Budget used: {budget_summary['spent_percentage']:.1f}%")
-    print(f"   Budget remaining: {format_time(budget_summary['remaining_time_seconds'])}")
-    
-    return results
-
-
-# ============================================================================
-# MAIN EXPERIMENT
-# ============================================================================
 
 def main():
-    import argparse
-    
-    parser = argparse.ArgumentParser(
-        description='Run complete active learning experiment'
-    )
-    parser.add_argument(
-        '--max_iterations',
-        type=int,
-        default=AL_CONFIG['max_iterations'],
-        help=f"Maximum AL iterations (default: {AL_CONFIG['max_iterations']})"
-    )
-    parser.add_argument(
-        '--log_experiment',
-        action='store_true',
-        help='Log to WandB/TensorBoard'
-    )
-    parser.add_argument(
-        '--verbose',
-        action='store_true',
-        default=True,
-        help='Print detailed progress'
-    )
+    parser = argparse.ArgumentParser(description='Run complete active learning experiment')
+    parser.add_argument('--n_iterations', type=int, default=AL_CONFIG['n_iterations'],
+                       help='Number of AL iterations')
+    parser.add_argument('--initial_episodes', type=int, default=INITIAL_DATASET_EPISODES,
+                       help='Number of initial exploration episodes')
+    parser.add_argument('--force_restart', action='store_true', help='Reset budget and start fresh')
+    parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'])
     
     args = parser.parse_args()
     
-    print("="*70)
-    print("MAIN EXPERIMENT: ACTIVE LEARNING FOR FERMENTATION OPTIMIZATION")
-    print("="*70)
-    print(f"\nConfiguration:")
-    print(f"  Max iterations: {args.max_iterations}")
-    print(f"  Queries per iteration: {AL_CONFIG['n_queries_per_iteration']}")
-    print(f"  Ensemble size: {AL_CONFIG['n_ensemble_models']}")
+    print("=" * 80)
+    print("🚀 STARTING SURROGATE-FERMENT MAIN EXPERIMENT")
+    print("=" * 80)
     
-    # Initialize logger
-    logger = None
-    if args.log_experiment:
-        logger = ExperimentLogger(
-            experiment_name='main_experiment',
-            config={
-                'max_iterations': args.max_iterations,
-                'n_queries_per_iteration': AL_CONFIG['n_queries_per_iteration'],
-                'n_ensemble_models': AL_CONFIG['n_ensemble_models']
-            }
-        )
+    # 0. Initialize Budget Tracker
+    budget_tracker = BudgetTracker(BUDGET_STATE_FILE, MAX_BUDGET_SECONDS)
+    if args.force_restart:
+        print("Resetting budget tracker...")
+        budget_tracker.reset()
     
-    # Initialize budget tracker
-    budget_tracker = BudgetTracker(budget_file=Path("budget.json"), max_budget_seconds=28800)
-    print(f"\n📊 Initial budget: {format_time(budget_tracker.max_budget_seconds)}")
+    status = budget_tracker.get_status()
+    print(f"Current Budget Usage: {status['usage_percentage']:.1f}% "
+          f"({format_time(status['spent_seconds'])} / {format_time(MAX_BUDGET_SECONDS)})")
+
+    # 1. INITIALIZATION (Iteration 0)
+    print("\n" + "#" * 40)
+    print("### ITERATION 0: INITIALIZATION ###")
+    print("#" * 40)
     
-    all_results = []
+    v0_dataset = get_dataset_path(0, "initial")
+    v0_state_scaler = get_scaler_path('state', 0)
+    v0_action_scaler = get_scaler_path('action', 0)
+    v0_surrogate = get_surrogate_path(0) # This will be the base path for ensemble
+    v0_policy = get_policy_path(0)
     
-    try:
-        # Run iteration 0
-        results_0 = run_iteration_zero(logger, args.verbose)
-        all_results.append(results_0)
+    # 1.1 Data Builder
+    run_command([
+        "python", "src/data_builder.py",
+        "--output_path", str(v0_dataset),
+        "--n_episodes", str(args.initial_episodes),
+        "--policy", "random",
+        "--use_budget"
+    ], "Generating initial dataset")
+    
+    # 1.2 Fit Scalers
+    run_command([
+        "python", "src/fit_scaler.py",
+        "--dataset_path", str(v0_dataset),
+        "--version", "0",
+        "--verify"
+    ], "Fitting initial scalers")
+    
+    # 1.3 Train Ensemble
+    for i in range(ENSEMBLE_SIZE):
+        run_command([
+            "python", "src/surrogate_model.py",
+            "--dataset_path", str(v0_dataset),
+            "--state_scaler_path", str(v0_state_scaler),
+            "--action_scaler_path", str(v0_action_scaler),
+            "--version", "0",
+            "--ensemble_index", str(i),
+            "--device", args.device
+        ], f"Training surrogate ensemble member {i}")
         
-        # Run active learning iterations
-        for iteration in range(1, args.max_iterations + 1):
-            # Check budget
-            budget_tracker = BudgetTracker(budget_file=Path("budget.json"), max_budget_seconds=28800)
-            if not budget_tracker.check_budget(1000):  # Need at least ~15 min
-                print(f"\n⚠️  Insufficient budget for iteration {iteration}, stopping")
-                break
+    # 1.4 Train RL Policy (Now using Ensemble implicitly)
+    run_command([
+        "python", "src/train_rl.py",
+        "--surrogate_path", str(v0_surrogate.parent), 
+        "--state_scaler_path", str(v0_state_scaler),
+        "--action_scaler_path", str(v0_action_scaler),
+        "--save_path", str(v0_policy),
+        "--total_timesteps", str(50000), # Shorter training for iteration 0
+        "--evaluate"
+    ], "Training initial RL policy on Surrogate Ensemble")
+    
+    # 1.5 Initial Evaluation
+    run_command([
+        "python", "src/evaluate_policy.py",
+        "--policy_path", str(v0_policy),
+        "--n_episodes", "10",
+        "--output_file", "results/eval_v0.json"
+    ], "Evaluating initial policy on HF model")
+
+    # 2. ITERATIVE LOOP
+    current_dataset = v0_dataset
+    
+    for iteration in range(1, args.n_iterations + 1):
+        print("\n" + "#" * 40)
+        print(f"### ITERATION {iteration} / {args.n_iterations} ###")
+        print("#" * 40)
+        
+        # Check budget
+        status = budget_tracker.get_status()
+        if status['remaining_seconds'] < 300: # Less than 5 mins remaining
+            print("⚠ Budget exhausted! Terminating experiment.")
+            break
             
-            results = run_al_iteration(iteration, logger, args.verbose)
+        prev_v = iteration - 1
+        curr_v = iteration
+        
+        prev_dataset = get_dataset_path(prev_v, "initial" if prev_v == 0 else "augmented")
+        prev_policy = get_policy_path(prev_v)
+        prev_state_scaler = get_scaler_path('state', prev_v)
+        prev_action_scaler = get_scaler_path('action', prev_v)
+        
+        curr_dataset = get_dataset_path(curr_v, "augmented")
+        curr_state_scaler = get_scaler_path('state', curr_v)
+        curr_action_scaler = get_scaler_path('action', curr_v)
+        curr_surrogate = get_surrogate_path(curr_v)
+        curr_policy = get_policy_path(curr_v)
+        
+        # 2.1 Active Learning Step
+        run_command([
+            "python", "src/active_learning.py",
+            "--dataset_path", str(prev_dataset),
+            "--policy_path", str(prev_policy),
+            "--ensemble_dir", str(prev_state_scaler.parent),
+            "--state_scaler_path", str(prev_state_scaler),
+            "--action_scaler_path", str(prev_action_scaler),
+            "--version", str(prev_v),
+            "--n_queries", str(AL_CONFIG['n_queries_per_iteration']),
+            "--output_path", str(curr_dataset),
+            "--selection_method", "uncertainty"
+        ], f"Active Learning iteration {iteration}")
+        
+        # 2.2 Refit Scalers
+        run_command([
+            "python", "src/fit_scaler.py",
+            "--dataset_path", str(curr_dataset),
+            "--version", str(curr_v)
+        ], f"Refitting scalers for version {curr_v}")
+        
+        # 2.3 Retrain Ensemble
+        for i in range(ENSEMBLE_SIZE):
+            run_command([
+                "python", "src/surrogate_model.py",
+                "--dataset_path", str(curr_dataset),
+                "--state_scaler_path", str(curr_state_scaler),
+                "--action_scaler_path", str(curr_action_scaler),
+                "--version", str(curr_v),
+                "--ensemble_index", str(i),
+                "--device", args.device
+            ], f"Retraining surrogate ensemble member {i}")
             
-            if results is None:
-                break
-            
-            all_results.append(results)
+        # 2.4 Retrain RL Policy
+        run_command([
+            "python", "src/train_rl.py",
+            "--surrogate_path", str(curr_surrogate.parent),
+            "--state_scaler_path", str(curr_state_scaler),
+            "--action_scaler_path", str(curr_action_scaler),
+            "--save_path", str(curr_policy),
+            "--total_timesteps", str(80000)
+        ], f"Retraining RL policy for version {curr_v} on Ensemble")
         
-    except Exception as e:
-        print(f"\n❌ Error during experiment: {e}")
-        raise
-    
-    finally:
-        # Save final results
-        final_results = {
-            'iterations': all_results,
-            'config': {
-                'max_iterations': args.max_iterations,
-                'n_queries_per_iteration': AL_CONFIG['n_queries_per_iteration'],
-                'n_ensemble_models': AL_CONFIG['n_ensemble_models']
-            }
-        }
-        
-        results_path = get_results_path('main_experiment_results')
-        with open(results_path, 'w') as f:
-            json.dump(final_results, f, indent=2)
-        
-        print(f"\n💾 Final results saved to: {results_path}")
-        
-        # Final budget summary
-        budget_tracker = BudgetTracker(budget_file=Path("budget.json"), max_budget_seconds=28800)
-        summary = budget_tracker.get_summary()
-        
-        print(f"\n{'='*70}")
-        print("EXPERIMENT COMPLETE")
-        print(f"{'='*70}")
-        print(f"Iterations completed: {len(all_results)}")
-        print(f"Final mean reward: {all_results[-1]['mean_reward']:.3f} ± {all_results[-1]['std_reward']:.3f}")
-        print(f"Total HF queries: {summary['total_queries']}")
-        print(f"Budget used: {summary['spent_percentage']:.1f}%")
-        print(f"Budget remaining: {format_time(summary['remaining_time_seconds'])}")
-        print(f"{'='*70}")
-        
-        if logger:
-            logger.finish()
+        # 2.5 Evaluate Policy
+        run_command([
+            "python", "src/evaluate_policy.py",
+            "--policy_path", str(curr_policy),
+            "--n_episodes", "10",
+            "--output_file", f"results/eval_v{curr_v}.json"
+        ], f"Evaluating policy v{curr_v} on HF model")
+
+    print("\n" + "=" * 80)
+    print("✅ EXPERIMENT COMPLETE")
+    print("=" * 80)
+    status = budget_tracker.get_status()
+    print(f"Final Budget Usage: {status['usage_percentage']:.1f}%")
+    print(f"Total HF Queries: {status['n_queries']}")
+    print("=" * 80)
 
 
 if __name__ == '__main__':

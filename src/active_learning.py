@@ -1,6 +1,6 @@
 """
 Active Learning module: uncertainty-based query selection and dataset augmentation.
-Implements ensemble uncertainty estimation and HF model querying.
+Implements Expected Fisher Information Gain (EFIG) for optimal candidate selection.
 """
 import argparse
 import sys
@@ -9,12 +9,13 @@ import numpy as np
 import pandas as pd
 import torch
 from stable_baselines3 import PPO
+from scipy.optimize import root
 
 # Add src to path if needed
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import (
-    STATE_DIM, ACTION_DIM, AL_CONFIG,
+    STATE_DIM, ACTION_DIM, AL_CONFIG, HF_PARAMS, RL_CONFIG,
     get_surrogate_path, get_scaler_path, get_dataset_path
 )
 from utils import (
@@ -32,68 +33,159 @@ from data_builder import calculate_reward
 # ============================================================================
 
 def generate_candidate_queries(
-    policy_path: Path,
+    policy: PPO,
     surrogate_path: Path,
     state_scaler_path: Path,
     action_scaler_path: Path,
     n_episodes: int = None,
     verbose: bool = True
 ) -> list:
-    """Generate candidate state-action pairs by running policy in surrogate env.
+    """Generate candidate state-action pairs using a mixed distribution.
+    
+    Mixed Distribution:
+    - 70% Policy-guided: Transitions visited by the current RL policy.
+    - 30% Uniform: Randomly sampled states and actions from the physical range.
     
     Args:
-        policy_path: Path to trained RL policy
+        policy: Trained SB3 PPO policy
         surrogate_path: Path to surrogate model
         state_scaler_path: Path to state scaler
         action_scaler_path: Path to action scaler
-        n_episodes: Number of episodes to run
+        n_episodes: Number of episodes to run for policy-guided part
         verbose: Print progress
         
     Returns:
         List of (state, action) tuples
     """
+    from config import INITIAL_STATE_RANGES, MAX_SUBSTRATE_ADDITION
+    
     if n_episodes is None:
-        n_episodes = AL_CONFIG['candidate_episodes']
+        n_episodes = AL_CONFIG.get('candidate_episodes', 20)
     
     if verbose:
-        print(f"\n🎯 Generating candidate queries...")
-        print(f"   Running policy for {n_episodes} episodes in surrogate environment")
+        print(f"\n🎯 Generating candidate queries (Mixed Distribution)...")
     
-    # Load policy
-    policy = PPO.load(policy_path)
+    # --- 1. Policy-guided Candidates (70%) ---
+    if verbose: print(f"   Running policy for {n_episodes} episodes in surrogate environment...")
     
-    # Create surrogate environment
     env = SurrogateEnv(
         surrogate_model_path=surrogate_path,
         state_scaler_path=state_scaler_path,
         action_scaler_path=action_scaler_path
     )
     
-    candidates = []
-    
-    for episode_idx in range(n_episodes):
+    policy_candidates = []
+    for _ in range(n_episodes):
         obs, info = env.reset()
-        
         while True:
-            # Get action from policy
             action, _ = policy.predict(obs, deterministic=True)
             action = np.array(action).flatten()
-            
-            # Store candidate
-            candidates.append((obs.copy(), action.copy()))
-            
-            # Step environment
+            policy_candidates.append((obs.copy(), action.copy()))
             obs, reward, terminated, truncated, info = env.step(action)
-            
-            if terminated or truncated:
-                break
-    
+            if terminated or truncated: break
     env.close()
     
+    # --- 2. Uniform Candidates (30%) ---
+    # We want roughly 30% of total candidates to be uniform
+    n_uniform = int(len(policy_candidates) * (0.3 / 0.7))
+    if verbose: print(f"   Sampling {n_uniform} uniform candidates from physical ranges...")
+    
+    uniform_candidates = []
+    for _ in range(n_uniform):
+        # Sample state from ranges
+        biomass = np.random.uniform(*INITIAL_STATE_RANGES['biomass'])
+        substrate = np.random.uniform(*INITIAL_STATE_RANGES['substrate'])
+        volume = np.random.uniform(*INITIAL_STATE_RANGES['volume'])
+        state = np.array([biomass, substrate, volume], dtype=np.float32)
+        
+        # Sample action from range
+        action = np.array([np.random.uniform(0.0, MAX_SUBSTRATE_ADDITION)], dtype=np.float32)
+        
+        uniform_candidates.append((state, action))
+        
+    candidates = policy_candidates + uniform_candidates
+    
     if verbose:
-        print(f"   ✓ Generated {len(candidates)} candidate queries")
+        print(f"   ✓ Total candidates: {len(candidates)} ({len(policy_candidates)} policy, {len(uniform_candidates)} uniform)")
     
     return candidates
+
+
+# ============================================================================
+# EXPECTED FISHER INFORMATION GAIN
+# ============================================================================
+
+def get_expected_fisher_information_gain(
+    state: np.ndarray,
+    action: np.ndarray,
+    policy: PPO,
+    ensemble_models: list,
+    state_scaler,
+    action_scaler,
+    device: str = 'cpu',
+    gamma: float = 0.99
+) -> float:
+    r"""Calculate the Expected Fisher Information Gain for a given state-action pair.
+    
+    IG(s,a) = || \nabla_phi \log \pi(a|s) ||_2 * | A(s,a) |
+    
+    This ensures we only query states that are BOTH:
+    1. Highly sensitive for the policy (large score gradient).
+    2. Highly relevant to the value landscape (large advantage).
+    """
+    obs_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+    act_tensor = torch.FloatTensor(action).unsqueeze(0).to(device)
+    
+    # 1. Compute Policy Score Gradient Norm
+    dist = policy.policy.get_distribution(obs_tensor)
+    log_prob = dist.log_prob(act_tensor)
+    
+    # Differentiate log_prob w.r.t the action network weights
+    actor_params = list(policy.policy.action_net.parameters())
+    grads = torch.autograd.grad(log_prob.mean(), actor_params, retain_graph=True)
+    grad_norm = torch.sqrt(sum(torch.sum(g ** 2) for g in grads)).item()
+    
+    # 2. Compute Advantage Estimate using Ensemble and Semi-Implicit Euler
+    with torch.no_grad():
+        v_s = policy.policy.predict_values(obs_tensor).item()
+        
+    state_scaled = state_scaler.transform(state.reshape(1, -1)).flatten()
+    action_scaled = action_scaler.transform(action.reshape(1, -1)).flatten()
+    
+    dt = HF_PARAMS['DT']
+    a_tensor = torch.FloatTensor(action_scaled).unsqueeze(0).to(device)
+    
+    # Semi-Implicit Euler via Root Finding (Matching Phase 2 Env Logic)
+    def residual(s_guess_np):
+        s_tensor = torch.FloatTensor(s_guess_np).unsqueeze(0).to(device)
+        input_tensor = torch.cat([s_tensor, a_tensor], dim=-1)
+        with torch.no_grad():
+            preds = [model(input_tensor) for model in ensemble_models]
+            mean_ds_dt = torch.mean(torch.stack(preds), dim=0).cpu().numpy().flatten()
+        return s_guess_np - state_scaled - dt * mean_ds_dt
+
+    # Solve for s_next
+    sol = root(residual, state_scaled, method='hybr')
+    s_next_scaled = sol.x
+    
+    next_state = state_scaler.inverse_transform(s_next_scaled.reshape(1, -1)).flatten().astype(np.float32)
+    next_state = np.clip(next_state, 0.0, None)
+    
+    # Get V(s_next)
+    obs_next_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(device)
+    with torch.no_grad():
+        v_s_next = policy.policy.predict_values(obs_next_tensor).item()
+        
+    # Reward
+    reward = calculate_reward(state, action, next_state)
+    
+    # Advantage
+    advantage = reward + gamma * v_s_next - v_s
+    
+    # 3. Final EFIG Calculation
+    efig = grad_norm * abs(advantage)
+    
+    return float(efig)
 
 
 # ============================================================================
@@ -103,27 +195,15 @@ def generate_candidate_queries(
 def select_best_queries(
     candidates: list,
     ensemble_models: list,
+    policy: PPO,
     state_scaler,
     action_scaler,
     n_queries: int,
-    selection_method: str = 'uncertainty',
+    selection_method: str = 'fisher_information',
     device: str = 'cpu',
     verbose: bool = True
 ) -> list:
-    """Select best queries based on uncertainty or random sampling.
-    
-    Args:
-        candidates: List of (state, action) tuples
-        ensemble_models: List of trained ensemble models
-        state_scaler: Fitted state scaler
-        action_scaler: Fitted action scaler
-        n_queries: Number of queries to select
-        selection_method: 'uncertainty' or 'random'
-        device: Device for computation
-        verbose: Print progress
-        
-    Returns:
-        List of selected (state, action) tuples
+    """Select best queries based on Fisher Information Gain, uncertainty, or random sampling.
     """
     if verbose:
         print(f"\n🔍 Selecting queries using '{selection_method}' method...")
@@ -131,41 +211,46 @@ def select_best_queries(
         print(f"   To select: {n_queries}")
     
     if selection_method == 'random':
-        # Random selection (for ablation study)
-        if verbose:
-            print(f"   Random sampling...")
         indices = np.random.choice(len(candidates), size=min(n_queries, len(candidates)), replace=False)
         selected = [candidates[i] for i in indices]
         
     elif selection_method == 'uncertainty':
-        # Uncertainty-based selection
-        if verbose:
-            print(f"   Computing uncertainty for {len(candidates)} candidates...")
-            print(f"   Using ensemble of {len(ensemble_models)} models")
-        
         uncertainties = []
+        for idx, (state, action) in enumerate(candidates):
+            unc = get_ensemble_uncertainty(state, action, ensemble_models, state_scaler, action_scaler, device)
+            uncertainties.append(unc)
+            if verbose and (idx + 1) % 500 == 0:
+                print(f"     Processed {idx + 1}/{len(candidates)} candidates")
+                
+        uncertainties = np.array(uncertainties)
+        top_indices = np.argsort(uncertainties)[-n_queries:][::-1]
+        selected = [candidates[i] for i in top_indices]
+        
+    elif selection_method == 'fisher_information':
+        if verbose:
+            print(f"   Computing Expected Fisher Information Gain for {len(candidates)} candidates...")
+            
+        gamma = RL_CONFIG.get('gamma', 0.99)
+        efig_scores = []
         
         for idx, (state, action) in enumerate(candidates):
-            uncertainty = get_ensemble_uncertainty(
-                state, action, ensemble_models,
-                state_scaler, action_scaler, device
+            score = get_expected_fisher_information_gain(
+                state, action, policy, ensemble_models, 
+                state_scaler, action_scaler, device, gamma
             )
-            uncertainties.append(uncertainty)
+            efig_scores.append(score)
             
             if verbose and (idx + 1) % 500 == 0:
                 print(f"     Processed {idx + 1}/{len(candidates)} candidates")
-        
-        uncertainties = np.array(uncertainties)
-        
-        # Select top-n by uncertainty
-        top_indices = np.argsort(uncertainties)[-n_queries:][::-1]
+                
+        efig_scores = np.array(efig_scores)
+        top_indices = np.argsort(efig_scores)[-n_queries:][::-1]
         selected = [candidates[i] for i in top_indices]
         
         if verbose:
             print(f"   ✓ Selected {len(selected)} queries")
-            print(f"   Uncertainty range: [{uncertainties.min():.6f}, {uncertainties.max():.6f}]")
-            print(f"   Selected mean uncertainty: {uncertainties[top_indices].mean():.6f}")
-    
+            print(f"   EFIG range: [{efig_scores.min():.6f}, {efig_scores.max():.6f}]")
+            print(f"   Selected mean EFIG: {efig_scores[top_indices].mean():.6f}")
     else:
         raise ValueError(f"Unknown selection method: {selection_method}")
     
@@ -183,15 +268,6 @@ def query_hf_model(
     verbose: bool = True
 ) -> list:
     """Query HF model for selected state-action pairs.
-    
-    Args:
-        queries: List of (state, action) tuples
-        budget_tracker: Budget tracker
-        params: HF model parameters
-        verbose: Print progress
-        
-    Returns:
-        List of (state, action, next_state, reward) tuples
     """
     from config import HF_PARAMS
     
@@ -202,16 +278,13 @@ def query_hf_model(
         print(f"\n🔬 Querying HF model...")
         print(f"   Number of queries: {len(queries)}")
     
-    # Estimate total time (rough estimate: 0.01s per query)
     estimated_time_per_query = 0.01
     estimated_total_time = len(queries) * estimated_time_per_query
     
     if verbose:
         print(f"   Estimated time: {format_time(estimated_total_time)}")
     
-    # Check budget
     if not budget_tracker.check_budget(estimated_total_time):
-        # Reduce queries to fit budget
         remaining_time = budget_tracker.get_remaining_time()
         max_queries = int(remaining_time / estimated_time_per_query)
         
@@ -227,14 +300,10 @@ def query_hf_model(
     total_time = 0.0
     
     for idx, (state, action) in enumerate(queries):
-        # Query HF model for next state
         next_state, elapsed_time = query_single_step(state, action, params)
         total_time += elapsed_time
-        
-        # Calculate reward
         reward = calculate_reward(state, action, next_state)
         
-        # Store transition
         new_transitions.append({
             'state': state,
             'action': action,
@@ -243,10 +312,8 @@ def query_hf_model(
         })
         
         if verbose and (idx + 1) % 100 == 0:
-            print(f"     Queried {idx + 1}/{len(queries)} | "
-                  f"Time: {format_time(total_time)}")
+            print(f"     Queried {idx + 1}/{len(queries)} | Time: {format_time(total_time)}")
     
-    # Update budget
     budget_tracker.update_budget(total_time)
     
     if verbose:
@@ -266,25 +333,13 @@ def augment_dataset(
     new_transitions: list,
     verbose: bool = True
 ) -> pd.DataFrame:
-    """Augment dataset with new transitions.
-    
-    Args:
-        old_dataset: Existing dataset
-        new_transitions: List of new transition dictionaries
-        verbose: Print progress
-        
-    Returns:
-        Augmented dataset
-    """
+    """Augment dataset with new transitions."""
     if verbose:
         print(f"\n📊 Augmenting dataset...")
         print(f"   Old size: {len(old_dataset)}")
         print(f"   New transitions: {len(new_transitions)}")
     
-    # Convert new transitions to DataFrame
     new_df = pd.DataFrame(new_transitions)
-    
-    # Concatenate
     augmented_dataset = pd.concat([old_dataset, new_df], ignore_index=True)
     
     if verbose:
@@ -300,7 +355,7 @@ def augment_dataset(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Active learning: select and query uncertain state-action pairs'
+        description='Active learning: select and query optimal state-action pairs using EFIG'
     )
     parser.add_argument('--dataset_path', type=str, required=True,
                        help='Path to current dataset')
@@ -318,8 +373,8 @@ def main():
                        help='Number of queries to select')
     parser.add_argument('--output_path', type=str, required=True,
                        help='Output path for augmented dataset')
-    parser.add_argument('--selection_method', type=str, default='uncertainty',
-                       choices=['uncertainty', 'random'],
+    parser.add_argument('--selection_method', type=str, default='fisher_information',
+                       choices=['fisher_information', 'uncertainty', 'random'],
                        help='Query selection method')
     parser.add_argument('--device', type=str, default='cpu',
                        choices=['cpu', 'cuda'])
@@ -327,32 +382,26 @@ def main():
     args = parser.parse_args()
     
     print("=" * 70)
-    print("ACTIVE LEARNING")
+    print("ACTIVE LEARNING (EXPECTED FISHER INFORMATION GAIN)")
     print("=" * 70)
     
-    # Load configuration
     n_queries = args.n_queries or AL_CONFIG['n_queries_per_iteration']
     n_ensemble = AL_CONFIG['n_ensemble_models']
     
-    # Initialize budget tracker
     budget_tracker = BudgetTracker(
         budget_file=Path('budget.json'),
         max_budget_seconds=28800  # 8 hours
     )
-    print(f"\n📊 Budget status:")
-    status = budget_tracker.get_status()
-    print(f"   Remaining: {format_time(status['remaining_seconds'])}")
-    print(f"   Used: {status['usage_percentage']:.1f}%")
     
-    # Load dataset
     print(f"\n📂 Loading dataset from: {args.dataset_path}")
     old_dataset = load_dataset(Path(args.dataset_path))
     
-    # Load scalers
     state_scaler = load_scaler(Path(args.state_scaler_path))
     action_scaler = load_scaler(Path(args.action_scaler_path))
     
-    # Load ensemble models
+    print(f"\n🧠 Loading PPO Policy...")
+    policy = PPO.load(args.policy_path, device=args.device)
+    
     print(f"\n🏗️  Loading ensemble models...")
     ensemble_models = []
     ensemble_dir = Path(args.ensemble_dir)
@@ -360,7 +409,6 @@ def main():
     for i in range(n_ensemble):
         model_path = get_surrogate_path(args.version, ensemble_index=i)
         if not model_path.exists():
-            print(f"   ⚠️  Model not found: {model_path}")
             continue
         
         model = SurrogateModel(state_dim=STATE_DIM, action_dim=ACTION_DIM)
@@ -370,20 +418,19 @@ def main():
         ensemble_models.append(model)
         print(f"   ✓ Loaded: {model_path.name}")
     
-    print(f"   Total models loaded: {len(ensemble_models)}")
-    
     # Step 1: Generate candidates
     candidates = generate_candidate_queries(
-        policy_path=Path(args.policy_path),
+        policy=policy,
         surrogate_path=get_surrogate_path(args.version, ensemble_index=0),
         state_scaler_path=Path(args.state_scaler_path),
-        action_scaler_path=Path(args.action_scaler_path)
+        action_scaler_path=Path(args.action_scaler_path),
     )
     
     # Step 2: Select best queries
     selected_queries = select_best_queries(
         candidates=candidates,
         ensemble_models=ensemble_models,
+        policy=policy,
         state_scaler=state_scaler,
         action_scaler=action_scaler,
         n_queries=n_queries,
@@ -404,21 +451,11 @@ def main():
     # Step 4: Augment dataset
     augmented_dataset = augment_dataset(old_dataset, new_transitions)
     
-    # Save augmented dataset
     output_path = Path(args.output_path)
     save_dataset(augmented_dataset, output_path)
     
-    # Final budget status
-    print(f"\n📊 Final budget status:")
-    status = budget_tracker.get_status()
-    print(f"   Used: {status['usage_percentage']:.1f}%")
-    print(f"   Remaining: {format_time(status['remaining_seconds'])}")
-    print(f"   Total queries: {status['n_queries']}")
-    
     print("\n" + "=" * 70)
     print("✅ ACTIVE LEARNING COMPLETE")
-    print("=" * 70)
-    print(f"Augmented dataset saved: {output_path}")
     print("=" * 70)
 
 

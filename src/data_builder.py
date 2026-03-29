@@ -68,35 +68,59 @@ class EpsilonGreedyPolicy:
 
 def calculate_reward(state: np.ndarray, action: np.ndarray, next_state: np.ndarray,
                      weights: dict = None) -> float:
-    """Calculate reward for a transition.
+    """Calculate reward for a transition based on mass-balance logic.
     
-    Multi-objective reward:
-    - Reward biomass growth
-    - Penalize substrate consumption cost
+    Reward Formula:
+    r = w1 * X_next - w2 * (m_consumed / V_avg) + w3 * m_feed + w4 * stability_bonus
     
     Args:
-        state: Current state [biomass, substrate]
-        action: Action taken [substrate_addition]
-        next_state: Next state [biomass, substrate]
+        state: Current state [biomass (X), substrate (S), volume (V)]
+        action: Action taken [feed_rate (m_feed) in g/h]
+        next_state: Next state [X, S, V]
         weights: Reward weights (default from config)
         
     Returns:
         Reward value
     """
-    from config import REWARD_WEIGHTS
+    from config import REWARD_WEIGHTS, HF_PARAMS
     
     if weights is None:
         weights = REWARD_WEIGHTS
     
-    # Biomass growth
-    biomass_growth = next_state[0] - state[0]
+    dt = HF_PARAMS['DT']
+    m_feed = max(0.0, action[0])
     
-    # Substrate cost (action is substrate addition)
-    substrate_cost = action[0]
+    # 1. Biomass Yield (X_next)
+    biomass_reward = next_state[0]
     
-    # Combined reward
-    reward = (weights['biomass_weight'] * biomass_growth - 
-              weights['substrate_cost'] * substrate_cost)
+    # 2. Mass-Balance Efficiency (m_consumed / V_avg)
+    # m_consumed = max(0, S_t*V_t + m_feed*dt - S_{t+1}*V_{t+1})
+    m_t = state[1] * state[2]
+    m_added = m_feed * dt
+    m_next = next_state[1] * next_state[2]
+    
+    m_consumed = max(0.0, m_t + m_added - m_next)
+    v_avg = (state[2] + next_state[2]) / 2.0
+    consumption_penalty = m_consumed / v_avg
+    
+    # 3. Feed Cost/Effort (m_feed)
+    feed_term = m_feed
+    
+    # 4. Stability Bonus
+    # Reward for keeping substrate in a "sweet spot" (e.g. 1.0 - 10.0 g/L)
+    # to avoid inhibition or starvation.
+    s_next = next_state[1]
+    if 1.0 <= s_next <= 10.0:
+        stability_reward = 1.0
+    else:
+        # Linear penalty if outside the range
+        dist = min(abs(s_next - 1.0), abs(s_next - 10.0))
+        stability_reward = max(0.0, 1.0 - 0.1 * dist)
+    
+    reward = (weights['biomass_weight'] * biomass_reward - 
+              weights['substrate_cost'] * consumption_penalty +
+              weights.get('action_penalty', -0.01) * feed_term +
+              weights.get('stability_bonus', 0.1) * stability_reward)
     
     return reward
 

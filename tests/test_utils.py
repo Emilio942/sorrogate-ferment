@@ -19,7 +19,7 @@ from utils import (
 )
 
 
-def _make_dummy_dataset(n_samples: int = 50, state_dim: int = 2, action_dim: int = 1):
+def _make_dummy_dataset(n_samples: int = 50, state_dim: int = 3, action_dim: int = 1):
     """Create an in-memory dummy dataset for testing."""
     rng = np.random.default_rng(seed=42)
     return pd.DataFrame({
@@ -32,7 +32,7 @@ def _make_dummy_dataset(n_samples: int = 50, state_dim: int = 2, action_dim: int
 
 def test_create_dummy_dataset():
     """Test dummy dataset creation."""
-    dataset = _make_dummy_dataset(n_samples=50, state_dim=2, action_dim=1)
+    dataset = _make_dummy_dataset(n_samples=50, state_dim=3, action_dim=1)
     
     assert len(dataset) == 50
     assert 'state' in dataset.columns
@@ -41,9 +41,9 @@ def test_create_dummy_dataset():
     assert 'reward' in dataset.columns
     
     # Check dimensions
-    assert len(dataset['state'].iloc[0]) == 2
+    assert len(dataset['state'].iloc[0]) == 3
     assert len(dataset['action'].iloc[0]) == 1
-    assert len(dataset['next_state'].iloc[0]) == 2
+    assert len(dataset['next_state'].iloc[0]) == 3
 
 
 def test_dataset_save_load():

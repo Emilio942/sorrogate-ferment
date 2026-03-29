@@ -112,6 +112,7 @@ class BudgetTracker:
         Returns:
             True if budget allows, False otherwise
         """
+        # Ensure we don't exceed max_budget
         return (self.spent_seconds + required_seconds) <= self.max_budget_seconds
     
     def update_budget(self, elapsed_seconds: float, n_queries: int = 1):

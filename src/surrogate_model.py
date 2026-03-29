@@ -1,6 +1,7 @@
 """
 Surrogate model implementation: PyTorch dataset, architecture, and training.
-Implements MLP for state transition prediction.
+Implements a Physics-Informed Neural ODE for state transition prediction
+with Dissipative Jacobian Regularization for A-stability.
 """
 import argparse
 import sys
@@ -18,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import (
     SURROGATE_CONFIG, STATE_DIM, ACTION_DIM,
-    get_surrogate_path, get_scaler_path
+    HF_PARAMS, get_surrogate_path, get_scaler_path
 )
 from utils import load_dataset, load_scaler, save_model, load_model
 from logger import ExperimentLogger
@@ -32,6 +33,7 @@ class FermentationDataset(Dataset):
     """PyTorch dataset for fermentation state transitions.
     
     Loads dataset and applies scaling transformations.
+    Targets are converted to scaled derivatives: ds/dt
     """
     
     def __init__(self, dataset_path: Path = None, state_scaler_path: Path = None, 
@@ -65,10 +67,22 @@ class FermentationDataset(Dataset):
         self.state_scaler = load_scaler(state_scaler_path)
         self.action_scaler = load_scaler(action_scaler_path)
         
-        # Extract data
-        self.states = np.array([s for s in self.df['state']])
-        self.actions = np.array([a for a in self.df['action']])
-        self.next_states = np.array([s for s in self.df['next_state']])
+        # Extract and PRE-SCALE data for efficiency
+        raw_states = np.array([s for s in self.df['state']])
+        raw_actions = np.array([a for a in self.df['action']])
+        raw_next_states = np.array([s for s in self.df['next_state']])
+        
+        print(f"   Scaling data...")
+        self.states_scaled = self.state_scaler.transform(raw_states).astype(np.float32)
+        self.actions_scaled = self.action_scaler.transform(raw_actions).astype(np.float32)
+        self.next_states_scaled = self.state_scaler.transform(raw_next_states).astype(np.float32)
+        
+        # Concatenate inputs once
+        self.inputs = np.concatenate([self.states_scaled, self.actions_scaled], axis=1)
+        
+        # Calculate scaled derivative ds/dt as the target
+        dt = HF_PARAMS['DT']
+        self.targets = (self.next_states_scaled - self.states_scaled) / dt
         
         print(f"   Dataset loaded: {len(self.df)} samples")
     
@@ -81,21 +95,10 @@ class FermentationDataset(Dataset):
         Returns:
             Tuple of (input, target) where:
                 - input: concatenated [scaled_state, scaled_action]
-                - target: scaled_next_state
+                - target: scaled_derivative (ds/dt)
         """
-        # Get raw data
-        state = self.states[idx]
-        action = self.actions[idx]
-        next_state = self.next_states[idx]
-        
-        # Apply scaling
-        state_scaled = self.state_scaler.transform(state.reshape(1, -1)).flatten()
-        action_scaled = self.action_scaler.transform(action.reshape(1, -1)).flatten()
-        next_state_scaled = self.state_scaler.transform(next_state.reshape(1, -1)).flatten()
-        
-        # Concatenate input: [state, action]
-        input_tensor = torch.FloatTensor(np.concatenate([state_scaled, action_scaled]))
-        target_tensor = torch.FloatTensor(next_state_scaled)
+        input_tensor = torch.from_numpy(self.inputs[idx])
+        target_tensor = torch.from_numpy(self.targets[idx])
         
         return input_tensor, target_tensor
 
@@ -105,10 +108,10 @@ class FermentationDataset(Dataset):
 # ============================================================================
 
 class SurrogateModel(nn.Module):
-    """MLP surrogate model for state transition prediction.
+    """Neural ODE surrogate model for state transition prediction.
     
     Input: [state, action] (scaled)
-    Output: next_state (scaled)
+    Output: d(state)/dt (scaled derivative)
     """
     
     def __init__(self, state_dim: int = STATE_DIM, action_dim: int = ACTION_DIM,
@@ -172,9 +175,61 @@ class SurrogateModel(nn.Module):
             x: Input tensor [batch_size, state_dim + action_dim]
             
         Returns:
-            Predicted next state [batch_size, state_dim]
+            Predicted scaled derivative d(state)/dt [batch_size, state_dim]
         """
         return self.network(x)
+
+
+# ============================================================================
+# DISSIPATIVE JACOBIAN REGULARIZATION
+# ============================================================================
+
+def compute_dissipative_loss(model: nn.Module, s: torch.Tensor, a: torch.Tensor, beta: float) -> torch.Tensor:
+    """Computes the dissipative loss to ensure A-stability of the ODE.
+    
+    Enforces that the largest eigenvalue of the symmetric part of the Jacobian
+    is non-positive.
+    
+    Args:
+        model: The surrogate model
+        s: Scaled state tensor [batch_size, state_dim]
+        a: Scaled action tensor [batch_size, action_dim]
+        beta: Regularization weight
+        
+    Returns:
+        Scalar loss tensor
+    """
+    s.requires_grad_(True)
+    x = torch.cat([s, a], dim=-1)
+    f = model(x)  # [B, n]
+    
+    B, n = s.shape
+    # Compute Jacobian J = df/ds
+    J = torch.zeros(B, n, n, device=s.device)
+    for i in range(n):
+        v = torch.zeros_like(f)
+        v[:, i] = 1.0
+        # retain_graph=True needed if we iterate
+        grad_s = torch.autograd.grad(f, s, grad_outputs=v, create_graph=True, retain_graph=True)[0]
+        J[:, i, :] = grad_s
+        
+    # Symmetric part S = 0.5 * (J + J^T)
+    S = 0.5 * (J + J.transpose(1, 2))
+    
+    # Power iteration to find the maximum eigenvalue of S
+    # Initialize with random vectors
+    v_pi = torch.randn_like(s)
+    for _ in range(20):
+        # bmm: [B, n, n] x [B, n, 1] -> [B, n, 1]
+        Sv = torch.bmm(S, v_pi.unsqueeze(-1)).squeeze(-1)
+        v_pi = torch.nn.functional.normalize(Sv, dim=-1)
+        
+    # Rayleigh quotient
+    lam_max = (v_pi * torch.bmm(S, v_pi.unsqueeze(-1)).squeeze(-1)).sum(dim=-1)
+    
+    # Penalize positive eigenvalues
+    penalty = torch.relu(lam_max) ** 2
+    return beta * penalty.mean()
 
 
 # ============================================================================
@@ -189,7 +244,7 @@ def train_surrogate(
     logger: ExperimentLogger = None,
     device: str = 'cpu'
 ) -> Tuple[nn.Module, dict]:
-    """Train surrogate model.
+    """Train surrogate model with physics-informed regularization.
     
     Args:
         model: Surrogate model
@@ -217,30 +272,49 @@ def train_surrogate(
     
     best_val_loss = float('inf')
     patience_counter = 0
+    beta_diss = config.get('beta_diss', 0.01)
     
     print(f"\n🚀 Starting training...")
     print(f"   Device: {device}")
     print(f"   Epochs: {config['epochs']}")
     print(f"   Learning rate: {config['learning_rate']}")
     print(f"   Batch size: {config['batch_size']}")
+    print(f"   Dissipative Beta: {beta_diss}")
     
     for epoch in range(config['epochs']):
         # Training phase
         model.train()
         train_loss = 0.0
+        diss_loss_total = 0.0
         
         for batch_idx, (inputs, targets) in enumerate(train_loader):
             inputs, targets = inputs.to(device), targets.to(device)
             
+            s = inputs[:, :STATE_DIM]
+            a = inputs[:, STATE_DIM:]
+            
             optimizer.zero_grad()
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            loss_mse = criterion(outputs, targets)
+            
+            # Compute dissipative loss on batch and random points
+            s_rand = torch.randn_like(s)  # Scaled states roughly N(0,1)
+            a_rand = torch.rand_like(a) * 2 - 1  # Random scaled actions
+            
+            s_combined = torch.cat([s.detach(), s_rand], dim=0)
+            a_combined = torch.cat([a.detach(), a_rand], dim=0)
+            
+            loss_diss = compute_dissipative_loss(model, s_combined, a_combined, beta_diss)
+            
+            loss = loss_mse + loss_diss
             loss.backward()
             optimizer.step()
             
-            train_loss += loss.item()
+            train_loss += loss_mse.item()
+            diss_loss_total += loss_diss.item()
         
         train_loss /= len(train_loader)
+        diss_loss_total /= len(train_loader)
         
         # Validation phase
         model.eval()
@@ -262,15 +336,17 @@ def train_surrogate(
         # Log metrics
         if logger is not None:
             logger.log_metrics({
-                'train_loss': train_loss,
+                'train_loss_mse': train_loss,
+                'train_loss_diss': diss_loss_total,
                 'val_loss': val_loss
             }, step=epoch)
         
         # Print progress
         if (epoch + 1) % 10 == 0:
             print(f"   Epoch {epoch+1}/{config['epochs']} | "
-                  f"Train Loss: {train_loss:.6f} | "
-                  f"Val Loss: {val_loss:.6f}")
+                  f"Train MSE: {train_loss:.6f} | "
+                  f"Train Diss: {diss_loss_total:.6f} | "
+                  f"Val MSE: {val_loss:.6f}")
         
         # Early stopping check
         if val_loss < best_val_loss:
@@ -309,16 +385,19 @@ def get_ensemble_uncertainty(
 ) -> float:
     """Calculate ensemble uncertainty for a state-action pair.
     
+    Uncertainty is defined as the mean variance across all state dimensions
+    in the normalized derivative space (ds/dt).
+    
     Args:
-        state: Current state
-        action: Action
-        ensemble_models: List of ensemble models
+        state: Current state [X, S, V]
+        action: Action [feed_rate]
+        ensemble_models: List of trained ensemble models
         state_scaler: Fitted state scaler
         action_scaler: Fitted action scaler
-        device: Device
+        device: Device for inference
         
     Returns:
-        Uncertainty score (variance over ensemble predictions)
+        Uncertainty score
     """
     # Scale inputs
     state_scaled = state_scaler.transform(state.reshape(1, -1)).flatten()
@@ -326,20 +405,21 @@ def get_ensemble_uncertainty(
     input_tensor = torch.FloatTensor(np.concatenate([state_scaled, action_scaled]))
     input_tensor = input_tensor.unsqueeze(0).to(device)
     
-    # Get predictions from all models
-    predictions = []
+    # Get predictions from all models (predicting ds/dt)
+    predictions_scaled = []
     for model in ensemble_models:
         model.eval()
         with torch.no_grad():
-            pred = model(input_tensor).cpu().numpy()
-            # Inverse transform to get actual next_state
-            pred_unscaled = state_scaler.inverse_transform(pred)
-            predictions.append(pred_unscaled.flatten())
+            pred_scaled = model(input_tensor).cpu().numpy()
+            predictions_scaled.append(pred_scaled.flatten())
     
-    predictions = np.array(predictions)  # [n_models, state_dim]
+    predictions_scaled = np.array(predictions_scaled)  # [n_models, state_dim]
     
-    # Calculate variance across models (uncertainty)
-    uncertainty = np.mean(np.var(predictions, axis=0))
+    # Calculate variance across models per dimension
+    variances = np.var(predictions_scaled, axis=0)
+    
+    # Mean variance across all state dimensions
+    uncertainty = np.mean(variances)
     
     return uncertainty
 
@@ -366,11 +446,12 @@ def main():
     args = parser.parse_args()
     
     print("=" * 70)
-    print("SURROGATE MODEL TRAINING")
+    print("SURROGATE MODEL TRAINING (NEURAL ODE)")
     print("=" * 70)
     
     # Configuration
     config = SURROGATE_CONFIG.copy()
+    config['beta_diss'] = 0.01  # Default Dissipative penalty weight
     
     # Initialize logger
     logger = None
@@ -390,7 +471,7 @@ def main():
         episode_ids = df['episode_id'].unique()
         np.random.shuffle(episode_ids)
         
-        val_split = config['validation_split']
+        val_split = config.get('validation_split', 0.2)
         n_val_episodes = int(len(episode_ids) * val_split)
         # Ensure at least one validation episode if possible
         if n_val_episodes == 0 and len(episode_ids) > 1:
@@ -407,7 +488,7 @@ def main():
     else:
         print("⚠ 'episode_id' not found in dataset! Using random split (potential data leakage).")
         # Fallback to random split
-        val_split = config['validation_split']
+        val_split = config.get('validation_split', 0.2)
         mask = np.random.rand(len(df)) < (1 - val_split)
         train_df = df[mask].reset_index(drop=True)
         val_df = df[~mask].reset_index(drop=True)
@@ -455,7 +536,7 @@ def main():
     print(f"\n🏗️  Model architecture:")
     print(f"   Input dim: {STATE_DIM + ACTION_DIM}")
     print(f"   Hidden layers: {config['hidden_layers']}")
-    print(f"   Output dim: {STATE_DIM}")
+    print(f"   Output dim: {STATE_DIM} (d(state)/dt)")
     print(f"   Total parameters: {sum(p.numel() for p in model.parameters())}")
     
     # Train model

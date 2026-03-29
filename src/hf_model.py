@@ -18,39 +18,55 @@ def hf_dynamics(t: float, y: np.ndarray, action: np.ndarray,
     """High-fidelity fermentation dynamics based on Monod kinetics.
     
     Implements the differential equations for:
-    - Biomass growth (Monod kinetics with death rate)
+    - Biomass growth (Monod kinetics)
     - Substrate consumption
+    - Volume expansion (dilution)
     
     Args:
-        t: Time (not used directly but required by solve_ivp)
-        y: State vector [biomass, substrate]
-        action: Control input [substrate_addition_rate]
-        params: Dictionary with parameters (MU_MAX, K_S, YXS, K_D)
+        t: Time
+        y: State vector [biomass, substrate, volume]
+        action: Control input [feed_rate (g/h)]
+        params: Dictionary with parameters
         
     Returns:
-        Time derivatives [dX/dt, dS/dt]
+        Time derivatives [dX/dt, dS/dt, dV/dt]
     """
     # Extract state variables
-    X = max(y[0], 1e-10)  # Biomass [g/L], ensure positive
-    S = max(y[1], 0.0)     # Substrate [g/L], ensure non-negative
+    X = max(y[0], 1e-10)  # Biomass concentration [g/L]
+    S = max(y[1], 0.0)     # Substrate concentration [g/L]
+    V = max(y[2], 0.1)     # Volume [L]
     
     # Extract parameters
-    mu_max = params['MU_MAX']  # Maximum specific growth rate [1/h]
-    K_s = params['K_S']        # Substrate saturation constant [g/L]
-    Y_xs = params['YXS']       # Yield coefficient [g biomass/g substrate]
-    k_d = params['K_D']        # Death rate constant [1/h]
+    mu_max = params['MU_MAX']
+    K_s = params['K_S']
+    Y_xs = params['YXS']
+    k_d = params['K_D']
     
-    # Extract control action
-    substrate_addition = max(action[0], 0.0)  # Substrate addition rate [g/L/h]
+    # Extract control action (feed rate in g/h)
+    feed_rate = max(action[0], 0.0) 
+    # Assume feed substrate concentration (e.g., 200 g/L)
+    S_feed = params.get('S_FEED', 200.0) 
     
-    # Monod kinetics: specific growth rate
+    # Feed volume flow rate [L/h]
+    F = feed_rate / S_feed
+    
+    # Specific growth rate
     mu = mu_max * S / (K_s + S)
     
     # Differential equations
-    dX_dt = mu * X - k_d * X                    # Biomass: growth - death
-    dS_dt = -mu * X / Y_xs + substrate_addition  # Substrate: consumption + addition
+    # dV/dt = Flow
+    dV_dt = F
     
-    return np.array([dX_dt, dS_dt])
+    # dX/dt = Growth - Death - Dilution
+    # X = m/V -> dX/dt = (1/V)*dm/dt - (m/V^2)*dV/dt = growth_rate - (X/V)*dV/dt
+    dX_dt = (mu - k_d) * X - (X / V) * dV_dt
+    
+    # dS/dt = Feed - Consumption - Dilution
+    # S = s/V -> dS/dt = (1/V)*ds/dt - (S/V)*dV/dt
+    # Feed rate is dm_s/dt = feed_rate (g/h)
+    dS_dt = (feed_rate / V) - (mu * X / Y_xs) - (S / V) * dV_dt
+    
+    return np.array([dX_dt, dS_dt, dV_dt])
 
 
 # ============================================================================
@@ -153,15 +169,16 @@ def sample_initial_state(ranges: Dict[str, Tuple[float, float]] = None) -> np.nd
                 (default: INITIAL_STATE_RANGES from config)
         
     Returns:
-        Initial state vector [biomass, substrate]
+        Initial state vector [biomass, substrate, volume]
     """
     if ranges is None:
         ranges = INITIAL_STATE_RANGES
     
     biomass = np.random.uniform(*ranges['biomass'])
     substrate = np.random.uniform(*ranges['substrate'])
+    volume = np.random.uniform(*ranges['volume'])
     
-    return np.array([biomass, substrate])
+    return np.array([biomass, substrate, volume])
 
 
 # ============================================================================
